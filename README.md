@@ -3,11 +3,13 @@
 Bot trả lời câu hỏi **chỉ dựa trên tài liệu bạn nạp vào** (PDF, kể cả bản scan; Word; TXT; link web) và ghi rõ nguồn: tên tài liệu, trang, Điều.
 Khi tài liệu không có câu trả lời, bot **hỏi bạn trước** rồi mới tìm trên internet (Tavily). Câu trả lời từ internet được gắn nhãn riêng.
 
+- **Đăng nhập**, nhiều tài khoản: mỗi người có bộ tài liệu riêng, người khác (kể cả admin) không xem được.
 - Nhiều **bộ tài liệu** tách biệt (ví dụ "Pháp luật giao thông", "Thuế"), mỗi lần hỏi chỉ tìm trong bộ đang chọn.
 - Chia đoạn theo cấu trúc **văn bản pháp luật** (Phần, Chương, Mục, Điều, khoản) và nhận diện số hiệu (`100/2019/NĐ-CP`).
 - Tìm kiếm kết hợp **ngữ nghĩa** (embedding) và **từ khóa** (giữ dấu tiếng Việt), nên hỏi "Điều 12 Nghị định 100/2019" vẫn trúng.
 - Trang PDF scan, hoặc PDF dùng font cũ TCVN3 bị lỗi chữ, được **OCR bằng LLM**.
-- Chọn **Gemini** (mặc định), **Wellflow** hoặc **OpenAI** trong file `.env`. Với Gemini, model quá tải hoặc hết lượt thì bot tự chuyển sang model dự phòng.
+- Trả lời và OCR dùng **Wellflow** (mặc định, Claude qua gateway), **Gemini** hoặc **OpenAI**. Embedding dùng **Gemini** (mặc định) hoặc OpenAI.
+  Model treo, quá tải hoặc hết lượt thì bot tự chuyển sang model dự phòng.
 
 ## Cài đặt
 
@@ -24,26 +26,52 @@ Mở `.env` và điền:
 
 | Biến | Lấy ở đâu | Bắt buộc |
 |---|---|---|
-| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | Có (khi dùng Gemini) |
+| `WELLFLOW_API_KEY` | https://wellflow.dev/dashboard | Có (khi `LLM_PROVIDER=wellflow`, mặc định) |
+| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | Có (embedding mặc định dùng Gemini) |
 | `TAVILY_API_KEY` | https://app.tavily.com (miễn phí 1.000 lượt/tháng) | Chỉ khi cần tìm internet |
 | `OPENAI_API_KEY` | https://platform.openai.com/api-keys | Chỉ khi `LLM_PROVIDER=openai` hoặc `EMBED_PROVIDER=openai` |
-| `WELLFLOW_*` | https://wellflow.dev/dashboard/docs/ | Chỉ khi dùng Wellflow (xem bên dưới) |
 
 ## Chạy
 
 ```bash
-.venv/bin/streamlit run app.py
+.venv/bin/python server.py
 ```
 
-Mở http://localhost:8501 rồi làm theo các bước:
+Mở http://localhost:8000 rồi làm theo các bước:
 
-1. **Tạo bộ tài liệu** ở thanh bên trái.
-2. **Nạp tài liệu**: kéo thả file, hoặc dán link (mỗi dòng một link) rồi bấm *Nạp*.
-3. **Đặt câu hỏi** ở khung chat. Bấm *📎 Nguồn* để xem đoạn trích gốc.
-4. Nếu bot báo không tìm thấy (hoặc chỉ trả lời được một phần), bạn có thể sửa truy vấn rồi bấm **🌐 Tìm trên internet**, hoặc bấm **Không, cảm ơn**.
-   Trang web tìm được có thể đưa vào bộ tài liệu bằng nút **➕ Thêm vào bộ tài liệu**.
+1. **Lần đầu**: tạo tài khoản quản trị (admin) ngay trên trang. Các lần sau thì đăng nhập.
+2. **Tạo bộ tài liệu**, ví dụ "Pháp luật giao thông".
+3. **Nạp tài liệu**: kéo thả file vào bất kỳ đâu trên trang, hoặc dán link vào ô bên trái rồi Enter.
+   Thanh bên trái hiện tiến trình của từng file, kể cả số trang đã OCR.
+4. **Đặt câu hỏi** ở ô dưới cùng (Enter gửi, Shift+Enter xuống dòng). Bấm số trích dẫn như **[1]** để mở đoạn trích gốc.
+5. Nếu tài liệu không có (hoặc chỉ có một phần) câu trả lời, bot hiện thẻ hỏi ý kiến: sửa truy vấn nếu cần rồi bấm
+   **Tìm trên internet**, hoặc **Không, cảm ơn**. Trang web tìm được có thể đưa vào bộ tài liệu bằng nút **Thêm vào bộ tài liệu**.
 
-Sửa `.env` xong thì phải khởi động lại ứng dụng (Ctrl+C rồi chạy lại).
+Giao diện tự theo chế độ sáng/tối của hệ điều hành, đổi bằng nút ở góc dưới thanh bên trái. Lịch sử hội thoại lưu trong trình duyệt, theo từng tài khoản và bộ tài liệu.
+Muốn mở từ máy khác trong mạng LAN: `.venv/bin/python server.py --host 0.0.0.0`.
+
+## Đăng nhập & tài khoản
+
+- **Tài khoản đầu tiên** là admin. Vì lý do bảo mật, màn hình tạo admin chỉ dùng được khi mở trang **trên chính máy chạy server**
+  (localhost). Server chạy ở máy khác thì tạo bằng lệnh `create-user` bên dưới.
+  Các bộ tài liệu tạo trước khi có đăng nhập sẽ thuộc về tài khoản admin đầu tiên.
+- **Mỗi tài khoản chỉ thấy bộ tài liệu của mình.** Admin thêm tài khoản, đặt lại mật khẩu, xóa tài khoản trong menu
+  *Quản lý tài khoản* (bấm tên mình ở góc dưới bên trái), nhưng cũng không xem được tài liệu của người khác.
+  Xóa một tài khoản sẽ xóa luôn các bộ tài liệu của tài khoản đó.
+- Mật khẩu ít nhất 8 ký tự, được băm bằng scrypt. Phiên đăng nhập kéo dài 30 ngày; đổi hoặc đặt lại mật khẩu sẽ đăng xuất các phiên khác.
+  Sai mật khẩu 5 lần liên tiếp thì bị khóa tạm 1 phút (tăng dần tới 15 phút).
+- Quản lý bằng dòng lệnh (dùng khi quên mật khẩu admin, hoặc server chạy trên máy chủ từ xa):
+
+```bash
+.venv/bin/python server.py create-user an --admin   # tạo tài khoản, hỏi mật khẩu
+.venv/bin/python server.py reset-password an        # đặt lại mật khẩu
+.venv/bin/python server.py list-users
+```
+
+- Mở ra **internet** thì nên đặt sau reverse proxy có **HTTPS** (Caddy, Nginx...), vì qua HTTP thường mật khẩu và cookie đi dạng không mã hóa.
+  Khi truy cập qua HTTPS, cookie phiên tự bật cờ `Secure`.
+
+Sửa `.env` xong thì phải khởi động lại server (Ctrl+C rồi chạy lại).
 
 ## Lưu ý
 
@@ -70,27 +98,36 @@ Khi thử, `gemini-3.8-flash` trả lời tốt nhất nhưng chậm (90–180 g
 Muốn dùng thường xuyên thì nên **bật thanh toán** trong Google AI Studio (Tier 1: chỉ cần liên kết tài khoản thanh toán).
 Gói trả phí có hạn mức cao hơn nhiều, và dữ liệu không bị dùng để cải thiện sản phẩm của Google.
 
-## Dùng Wellflow
+## Wellflow (mặc định cho trả lời và OCR)
 
-Wellflow được gọi qua API chuẩn OpenAI (`/chat/completions`, `/embeddings`). Điền vào `.env`:
+Wellflow là gateway theo chuẩn OpenAI (`https://api.wellflow.dev/v1/chat/completions`), có Claude, GPT, Gemini, DeepSeek...
+Xem danh sách model bằng `GET /v1/models`. Wellflow **chưa có API embedding** (`/v1/embeddings` trả 501), nên embedding dùng Gemini.
 
 ```
 LLM_PROVIDER=wellflow
-EMBED_PROVIDER=wellflow           # hoặc giữ gemini nếu Wellflow không có model embedding
+EMBED_PROVIDER=gemini
 WELLFLOW_API_KEY=wf_...
-WELLFLOW_BASE_URL=https://<host>/v1
-WELLFLOW_CHAT_MODEL=<model chat, nên chọn loại đọc được ảnh để OCR>
-WELLFLOW_EMBED_MODEL=<model embedding>
+WELLFLOW_BASE_URL=https://api.wellflow.dev/v1
+WELLFLOW_CHAT_MODEL=claude-opus-5-5
+WELLFLOW_FALLBACK_MODELS=claude-sonnet-5-5,claude-haiku-5.5
 ```
 
-Đổi `EMBED_PROVIDER` thì các bộ tài liệu đã có phải bấm **Re-index**.
+Đo thử ngày 01/11/2026 (cả ba đều OCR đúng dấu tiếng Việt và trích dẫn đúng):
+
+| Model | Chat | Trả lời từ tài liệu (JSON) | OCR 1 trang |
+|---|---|---|---|
+| claude-opus-5-5 | 8 giây | 14–47 giây | 17 giây |
+| claude-sonnet-5-5 | 10–42 giây | 6 giây | 22 giây |
+| claude-haiku-5.5 | 5 giây | 5 giây | 36 giây |
+
+Đôi khi một request bị treo quá 30 giây. Khi đó bot chuyển sang model kế tiếp trong `WELLFLOW_FALLBACK_MODELS`.
 
 ## Dữ liệu được lưu ở đâu
 
 Mọi thứ nằm trong thư mục `data/` (không đưa vào git):
 
 ```
-data/ragbot.db   danh mục bộ tài liệu, tài liệu, chỉ mục từ khóa (SQLite FTS5)
+data/ragbot.db   tài khoản, phiên đăng nhập, danh mục bộ tài liệu, tài liệu, chỉ mục từ khóa (SQLite FTS5)
 data/chroma/     vector embedding (ChromaDB)
 data/files/      file gốc đã upload
 data/texts/      văn bản đã trích (kể cả kết quả OCR), dùng khi re-index
@@ -101,7 +138,10 @@ Muốn xóa sạch thì dừng app rồi xóa thư mục `data/`.
 ## Cấu trúc mã nguồn
 
 ```
-app.py                       giao diện Streamlit
+server.py                    chạy web server (FastAPI + uvicorn)
+web/                         giao diện: index.html, style.css, app.js (không cần build)
+ragbot/api.py                API cho giao diện; thao tác dài trả tiến trình dạng NDJSON
+ragbot/auth.py               tài khoản, băm mật khẩu, phiên đăng nhập, chống dò mật khẩu
 ragbot/config.py             đọc cấu hình .env
 ragbot/providers/            Gemini / OpenAI: chat, JSON có schema, OCR ảnh, embedding
 ragbot/ingest/loaders.py     đọc PDF (OCR trang scan), DOCX, TXT, link
@@ -119,4 +159,5 @@ ragbot/prompts.py            prompt tiếng Việt
 .venv/bin/python -m pytest -q
 ```
 
-Test dùng LLM và embedding giả lập nên không cần API key, gồm cả test giao diện bằng Streamlit AppTest.
+Test dùng LLM và embedding giả lập nên không cần API key, gồm cả test API của giao diện web, đăng nhập,
+phân quyền và tách dữ liệu giữa các tài khoản (FastAPI TestClient).

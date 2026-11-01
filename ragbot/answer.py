@@ -1,4 +1,5 @@
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlparse
@@ -10,8 +11,15 @@ from .websearch import TavilySearch
 
 Coverage = Literal["full", "partial", "none"]
 HISTORY_TURNS = 6
-EXCERPT_CHARS = 600
+# Gửi cả đoạn (tối đa ~2000 ký tự); giao diện tự thu gọn còn 3 dòng, bấm vào mới mở hết.
+EXCERPT_CHARS = 2400
 WEB_CONTENT_CHARS = 3000
+
+ProgressFn = Callable[[str], None]
+
+
+def _noop(_: str) -> None:
+    pass
 
 
 @dataclass
@@ -85,14 +93,19 @@ def answer_from_docs(
     history: list[dict],
     top_k: int,
     min_similarity: float = 0.0,
+    progress: ProgressFn = _noop,
 ) -> Answer:
+    if history:
+        progress("Đang hiểu câu hỏi trong ngữ cảnh hội thoại...")
     standalone = condense_question(llm, history, question)
+    progress("Đang tìm trong tài liệu...")
     hits = retriever.search(collection_id, standalone, top_k)
 
     best = max((h.similarity for h in hits if h.similarity is not None), default=0.0)
     if not hits or (min_similarity > 0 and best < min_similarity):
         return Answer(kind="docs", coverage="none", text="", question=standalone, web_query=standalone)
 
+    progress(f"Đang đọc {len(hits)} đoạn liên quan và soạn câu trả lời...")
     result = llm.complete_json(
         prompts.DOCS_SYSTEM,
         prompts.DOCS_USER.format(context=format_context(hits), question=standalone),
@@ -119,11 +132,13 @@ def answer_from_docs(
     )
 
 
-def answer_from_web(llm: LLM, search: TavilySearch, query: str, question: str) -> Answer:
+def answer_from_web(llm: LLM, search: TavilySearch, query: str, question: str, progress: ProgressFn = _noop) -> Answer:
+    progress("Đang tìm trên internet...")
     results = search.search(query)
     if not results:
         return Answer(kind="web", coverage="none", text="Không tìm thấy kết quả phù hợp trên internet.", question=question)
 
+    progress(f"Đang đọc {len(results)} trang web và tổng hợp câu trả lời...")
     context = "\n\n".join(
         f"[{n}] {r.title}\nURL: {r.url}\n{r.content[:WEB_CONTENT_CHARS]}" for n, r in enumerate(results, 1)
     )

@@ -3,7 +3,7 @@ import json
 
 import openai
 
-from .base import CHAT_TIMEOUT_S, OCR_TIMEOUT_S, REQUEST_TIMEOUT_S, EmbedKind, api_retry, batched
+from .base import CHAT_TIMEOUT_S, OCR_TIMEOUT_S, REQUEST_TIMEOUT_S, EmbedKind, api_retry, batched, call_with_fallback
 
 
 class OpenAILLM:
@@ -58,20 +58,24 @@ class OpenAILLM:
 class ChatCompletionsLLM:
     """Dịch vụ tương thích OpenAI qua /chat/completions (Wellflow và các gateway tương tự)."""
 
-    def __init__(self, api_key: str, base_url: str, model: str, provider: str):
+    def __init__(self, api_key: str, base_url: str, models: list[str], provider: str):
         self.client = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=REQUEST_TIMEOUT_S, max_retries=0)
-        self.model = model
-        self.name = f"{provider}:{model}"
-
-    def _chat(self, messages: list[dict], timeout: int, **kwargs) -> str:
-        resp = self.client.chat.completions.create(model=self.model, messages=messages, timeout=timeout, **kwargs)
-        return resp.choices[0].message.content or ""
+        # Model đầu là model chính, các model sau dùng khi model trước treo hoặc quá tải.
+        self.models = models
+        self.provider = provider
+        self.name = f"{provider}:{models[0]}"
 
     @api_retry
+    def _chat(self, messages: list[dict], timeout: int, **kwargs) -> str:
+        def call(model: str) -> str:
+            resp = self.client.chat.completions.create(model=model, messages=messages, timeout=timeout, **kwargs)
+            return resp.choices[0].message.content or ""
+
+        return call_with_fallback(self.models, call, f"{self.provider} đã hết hạn mức cho {{models}}.")
+
     def complete(self, system: str, user: str) -> str:
         return self._chat([{"role": "system", "content": system}, {"role": "user", "content": user}], CHAT_TIMEOUT_S)
 
-    @api_retry
     def complete_json(self, system: str, user: str, schema: dict) -> dict:
         text = self._chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -80,7 +84,6 @@ class ChatCompletionsLLM:
         )
         return parse_json(text)
 
-    @api_retry
     def ocr(self, png: bytes, instruction: str) -> str:
         image_url = "data:image/png;base64," + base64.b64encode(png).decode()
         content = [{"type": "text", "text": instruction}, {"type": "image_url", "image_url": {"url": image_url}}]

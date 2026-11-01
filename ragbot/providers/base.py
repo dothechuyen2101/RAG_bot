@@ -1,5 +1,6 @@
 import logging
-from typing import Literal, Protocol
+from collections.abc import Callable
+from typing import Literal, Protocol, TypeVar
 
 import httpx
 import openai
@@ -63,6 +64,31 @@ def is_transient(exc: BaseException) -> bool:
 def describe_error(exc: BaseException) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     return f"{status} {type(exc).__name__}" if status else type(exc).__name__
+
+
+T = TypeVar("T")
+
+
+def call_with_fallback(models: list[str], call: Callable[[str], T], quota_message: str) -> T:
+    """Gọi lần lượt từng model. Model quá tải hoặc treo (503/429/504/timeout) thì chuyển ngay sang model
+    kế tiếp; model hết hạn mức theo ngày thì bỏ qua. Lỗi tạm thời ở model cuối được ném ra để api_retry
+    chờ một lúc rồi thử lại từ đầu danh sách."""
+    exhausted = []
+    for i, model in enumerate(models):
+        is_last = i == len(models) - 1
+        try:
+            return call(model)
+        except Exception as e:
+            if is_quota_exhausted(e):
+                exhausted.append(model)
+                if is_last:
+                    break
+                log.warning("%s đã hết hạn mức trong ngày, chuyển sang %s", model, models[i + 1])
+                continue
+            if not is_transient(e) or is_last:
+                raise
+            log.warning("%s lỗi tạm thời (%s), chuyển sang %s", model, describe_error(e), models[i + 1])
+    raise QuotaExhaustedError(quota_message.format(models=", ".join(exhausted)))
 
 
 # Gói miễn phí hay bị 429, nên chờ lâu dần rồi thử lại.

@@ -4,18 +4,12 @@ import math
 from google import genai
 from google.genai import types
 
-from .base import (
-    CHAT_TIMEOUT_S,
-    OCR_TIMEOUT_S,
-    REQUEST_TIMEOUT_S,
-    EmbedKind,
-    api_retry,
-    batched,
-    QuotaExhaustedError,
-    describe_error,
-    is_quota_exhausted,
-    is_transient,
-    log,
+from .base import CHAT_TIMEOUT_S, OCR_TIMEOUT_S, REQUEST_TIMEOUT_S, EmbedKind, api_retry, batched, call_with_fallback
+
+QUOTA_MESSAGE = (
+    "Gemini đã hết hạn mức trong ngày cho {models} (gói miễn phí chỉ có khoảng 20 lượt/ngày mỗi model). "
+    "Hạn mức đặt lại lúc 0h giờ Pacific, khoảng 15h giờ Việt Nam. Muốn dùng nhiều hơn thì bật thanh toán "
+    "trong Google AI Studio, hoặc đổi LLM_PROVIDER trong file .env."
 )
 
 
@@ -41,27 +35,10 @@ class GeminiLLM:
 
     @api_retry
     def _generate(self, contents, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
-        """Gọi lần lượt từng model. Model báo quá tải (503/429/504) thì chuyển ngay sang model kế tiếp;
-        hết danh sách thì api_retry chờ một lúc rồi thử lại từ đầu."""
-        exhausted = []
-        for i, model in enumerate(self.models):
-            is_last = i == len(self.models) - 1
-            try:
-                return self.client.models.generate_content(model=model, contents=contents, config=config)
-            except Exception as e:
-                if is_quota_exhausted(e):
-                    exhausted.append(model)
-                    if is_last:
-                        break
-                    log.warning("%s đã hết hạn mức trong ngày, chuyển sang %s", model, self.models[i + 1])
-                    continue
-                if not is_transient(e) or is_last:
-                    raise
-                log.warning("%s lỗi tạm thời (%s), chuyển sang %s", model, describe_error(e), self.models[i + 1])
-        raise QuotaExhaustedError(
-            f"Gemini đã hết hạn mức trong ngày cho {', '.join(exhausted)} (gói miễn phí chỉ có khoảng 20 lượt/ngày "
-            "mỗi model). Hạn mức đặt lại lúc 0h giờ Pacific, khoảng 15h giờ Việt Nam. Muốn dùng nhiều hơn thì "
-            "bật thanh toán trong Google AI Studio, hoặc đổi LLM_PROVIDER trong file .env."
+        return call_with_fallback(
+            self.models,
+            lambda model: self.client.models.generate_content(model=model, contents=contents, config=config),
+            QUOTA_MESSAGE,
         )
 
     def complete(self, system: str, user: str) -> str:

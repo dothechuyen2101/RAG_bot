@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 
 from ragbot.config import Settings
 from ragbot.providers.base import QuotaExhaustedError, is_quota_exhausted, is_transient
 from ragbot.providers.gemini import GeminiLLM
-from ragbot.providers.openai_provider import parse_json
+from ragbot.providers import openai_base_url
+from ragbot.providers.openai_provider import ChatCompletionsLLM, parse_json
 
 
 class ApiError(Exception):
@@ -81,3 +84,40 @@ def test_parse_json_strips_code_fence():
 def test_gemini_models_setting_dedupes_and_keeps_order():
     s = Settings(_env_file=None, gemini_chat_model="m1", gemini_fallback_models=" m2, m1 ,m3,")
     assert s.gemini_models == ["m1", "m2", "m3"]
+
+
+def _chat_llm(behaviour: dict) -> tuple[ChatCompletionsLLM, list[str]]:
+    """Gateway tương thích OpenAI; behaviour: model -> Exception hoặc chuỗi trả về."""
+    llm = ChatCompletionsLLM("wf_test", "http://localhost/v1", ["opus", "sonnet", "haiku"], "wellflow")
+    called = []
+
+    def create(model, messages, timeout, **kwargs):
+        called.append(model)
+        result = behaviour[model]
+        if isinstance(result, Exception):
+            raise result
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=result))])
+
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    return llm, called
+
+
+def test_gateway_timeout_falls_back_to_next_model():
+    timeout = openai.APITimeoutError(request=httpx.Request("POST", "http://localhost/v1/chat/completions"))
+    llm, called = _chat_llm({"opus": timeout, "sonnet": '{"ok": 1}', "haiku": "x"})
+    assert llm.complete_json("sys", "hi", {}) == {"ok": 1}
+    assert called == ["opus", "sonnet"]
+    assert llm.name == "wellflow:opus"
+
+
+def test_openai_base_url_adds_v1_only_when_missing():
+    assert openai_base_url("https://api.wellflow.dev") == "https://api.wellflow.dev/v1"
+    assert openai_base_url("https://api.wellflow.dev/") == "https://api.wellflow.dev/v1"
+    assert openai_base_url("https://api.wellflow.dev/v1") == "https://api.wellflow.dev/v1"
+    assert openai_base_url("https://gw.example.com/openai/v2/") == "https://gw.example.com/openai/v2"
+
+
+def test_wellflow_settings_defaults():
+    s = Settings(_env_file=None)
+    assert s.llm_provider == "wellflow" and s.embed_provider == "gemini"
+    assert s.wellflow_models == ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5.5"]

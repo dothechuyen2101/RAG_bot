@@ -10,13 +10,15 @@ ROOT = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT / ".env", env_file_encoding="utf-8", extra="ignore")
 
-    llm_provider: Literal["gemini", "wellflow", "openai"] = "gemini"
+    llm_provider: Literal["wellflow", "gemini", "openai"] = "wellflow"
+    # Wellflow chưa có API embedding (/v1/embeddings trả 501), nên embedding mặc định dùng Gemini.
     embed_provider: Literal["gemini", "wellflow", "openai"] = "gemini"
 
-    # Wellflow: API tương thích OpenAI (/chat/completions, /embeddings).
+    # Wellflow: gateway tương thích OpenAI (/v1/chat/completions).
     wellflow_api_key: str = ""
-    wellflow_base_url: str = ""
-    wellflow_chat_model: str = ""
+    wellflow_base_url: str = "https://api.wellflow.dev/v1"
+    wellflow_chat_model: str = "claude-opus-5-5"
+    wellflow_fallback_models: str = "claude-sonnet-5-5,claude-haiku-5.5"
     wellflow_embed_model: str = ""
 
     gemini_api_key: str = ""
@@ -43,8 +45,16 @@ class Settings(BaseSettings):
 
     @property
     def gemini_models(self) -> list[str]:
-        fallbacks = [m.strip() for m in self.gemini_fallback_models.split(",") if m.strip()]
-        return list(dict.fromkeys([self.gemini_chat_model, *fallbacks]))
+        return _with_fallbacks(self.gemini_chat_model, self.gemini_fallback_models)
+
+    @property
+    def wellflow_models(self) -> list[str]:
+        return _with_fallbacks(self.wellflow_chat_model, self.wellflow_fallback_models)
+
+
+def _with_fallbacks(primary: str, fallbacks: str) -> list[str]:
+    """Model chính rồi tới các model dự phòng (chuỗi cách nhau bởi dấu phẩy), bỏ trùng."""
+    return list(dict.fromkeys([primary, *(m.strip() for m in fallbacks.split(",") if m.strip())]))
 
 
 @lru_cache

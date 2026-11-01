@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>RAG Bot</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232563eb'/%3E%3Cstop offset='1' stop-color='%237c3aed'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M10 9h8a5 5 0 0 1 0 10h-3l4 5' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M10 9v15' stroke='white' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // Đặt theme trước khi vẽ trang để không bị nháy màu.
+    try {
+      const t = localStorage.getItem("ragbot.theme");
+      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    } catch {}
+  </script>
+</head>
+<body>
+  <!-- Màn hình đăng nhập / tạo tài khoản admin đầu tiên -->
+  <div class="auth" id="auth" hidden>
+    <div class="auth-bg" aria-hidden="true"><span></span><span></span><span></span></div>
+    <form class="auth-card" id="auth-form" novalidate>
+      <div class="auth-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M7 5h6a4 4 0 0 1 0 8h-2l3 5" /><path d="M7 5v13" /></svg>
+      </div>
+      <h1 id="auth-title">Đăng nhập</h1>
+      <p class="auth-sub" id="auth-sub">Hỏi đáp theo tài liệu của bạn</p>
+      <div id="auth-fields">
+        <label class="field">
+          <span>Tên đăng nhập</span>
+          <input class="input" id="auth-username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" required>
+        </label>
+        <label class="field">
+          <span>Mật khẩu</span>
+          <span class="pw">
+            <input class="input" id="auth-password" type="password" autocomplete="current-password" required>
+            <button class="icon-btn small pw-toggle" type="button" id="pw-toggle" aria-label="Hiện mật khẩu" title="Hiện mật khẩu">
+              <svg class="eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+              <svg class="eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 6.6A17 17 0 0 0 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2" /></svg>
+            </button>
+          </span>
+        </label>
+        <label class="field" id="auth-confirm-field" hidden>
+          <span>Nhập lại mật khẩu</span>
+          <input class="input" id="auth-confirm" type="password" autocomplete="new-password">
+        </label>
+        <div class="form-error" id="auth-error" role="alert" hidden></div>
+        <button class="btn primary auth-submit" type="submit" id="auth-submit">
+          <span class="label">Đăng nhập</span><span class="spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+      <p class="auth-foot" id="auth-foot"></p>
+    </form>
+  </div>
+
+  <div class="app" hidden>
+    <aside class="sidebar" id="sidebar" aria-label="Bộ tài liệu">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M7 5h6a4 4 0 0 1 0 8h-2l3 5" /><path d="M7 5v13" /></svg>
+        </div>
+        <div>
+          <div class="brand-name">RAG Bot</div>
+          <div class="brand-sub">Hỏi đáp theo tài liệu của bạn</div>
+        </div>
+      </div>
+
+      <section class="side-section">
+        <div class="section-head">
+          <span>Bộ tài liệu</span>
+          <button class="icon-btn small" id="new-collection-btn" title="Tạo bộ tài liệu mới" aria-label="Tạo bộ tài liệu mới">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+        </div>
+        <form class="inline-form" id="new-collection-form" hidden>
+          <input id="new-collection-name" placeholder="Tên bộ, ví dụ: Pháp luật giao thông" maxlength="80" autocomplete="off">
+          <button class="btn primary small" type="submit">Tạo</button>
+        </form>
+        <ul class="collection-list" id="collection-list"></ul>
+      </section>
+
+      <section class="side-section documents" id="documents-section">
+        <div class="section-head">
+          <span>Tài liệu</span>
+          <span class="pill" id="doc-count">0</span>
+        </div>
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple accept=".pdf,.docx,.txt,.md" hidden>
+          <span class="dropzone-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5" /><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" /></svg>
+          </span>
+          <span class="dropzone-text"><b>Kéo thả file vào đây</b><small>PDF (kể cả bản scan), Word, TXT · hoặc bấm để chọn</small></span>
+        </label>
+        <form class="url-form" id="url-form">
+          <span class="url-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1" /><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1" /></svg>
+          </span>
+          <input id="url-input" type="url" placeholder="Dán link văn bản rồi Enter" autocomplete="off">
+          <button class="icon-btn small" type="submit" title="Nạp link" aria-label="Nạp link">
+            <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+          </button>
+        </form>
+        <ul class="doc-list" id="doc-list"></ul>
+      </section>
+
+      <footer class="side-foot">
+        <div class="model-info" id="model-info"></div>
+        <div class="foot-row">
+          <button class="user-btn" id="user-btn" aria-haspopup="menu" aria-expanded="false">
+            <span class="user-avatar" id="user-avatar"></span>
+            <span class="user-text"><b id="user-name"></b><small id="user-role"></small></span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg>
+          </button>
+          <button class="icon-btn" id="theme-toggle" title="Đổi giao diện sáng/tối" aria-label="Đổi giao diện sáng/tối">
+            <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+            <svg class="moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" /></svg>
+          </button>
+        </div>
+        <div class="menu" id="user-menu" role="menu" hidden>
+          <button role="menuitem" id="menu-password">
+            <svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>Đổi mật khẩu
+          </button>
+          <button role="menuitem" id="menu-users" hidden>
+            <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="4" /><path d="M2 21a7 7 0 0 1 14 0M17 11a3 3 0 1 0 0-6M22 21a6 6 0 0 0-4-5.6" /></svg>Quản lý tài khoản
+          </button>
+          <hr>
+          <button role="menuitem" class="danger" id="menu-logout">
+            <svg viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H3" /></svg>Đăng xuất
+          </button>
+        </div>
+      </footer>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Mở danh sách bộ tài liệu">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+        </button>
+        <div class="title-wrap">
+          <h1 id="collection-title">RAG Bot</h1>
+          <p id="collection-sub"></p>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn ghost small" id="clear-chat-btn" hidden>
+            <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>
+            <span>Hội thoại mới</span>
+          </button>
+          <button class="icon-btn danger-hover" id="delete-collection-btn" title="Xóa bộ tài liệu này" aria-label="Xóa bộ tài liệu này" hidden>
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="banner" id="reindex-banner" hidden>
+        <svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01" /><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /></svg>
+        <span id="reindex-text"></span>
+        <button class="btn primary small" id="reindex-btn">Re-index</button>
+      </div>
+
+      <section class="chat" id="chat" aria-live="polite">
+        <div class="chat-inner" id="messages"></div>
+      </section>
+
+      <form class="composer" id="composer">
+        <div class="composer-box">
+          <textarea id="question" rows="1" placeholder="Hỏi về tài liệu trong bộ này..." aria-label="Câu hỏi"></textarea>
+          <button class="send-btn" id="send-btn" type="submit" aria-label="Gửi câu hỏi" disabled>
+            <svg class="send-icon" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+        </div>
+        <p class="composer-hint">Bot chỉ trả lời từ tài liệu của bạn và luôn hỏi trước khi tìm trên internet · <kbd>Enter</kbd> gửi, <kbd>Shift</kbd>+<kbd>Enter</kbd> xuống dòng</p>
+      </form>
+    </main>
+  </div>
+
+  <div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
+
+  <dialog class="dialog" id="confirm-dialog">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="dialog-actions">
+        <button class="btn ghost" value="cancel">Hủy</button>
+        <button class="btn danger" value="ok" id="confirm-ok">Xóa</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog" id="password-dialog">
+    <form id="password-form" novalidate>
+      <h2>Đổi mật khẩu</h2>
+      <p>Các thiết bị khác đang đăng nhập tài khoản này sẽ bị đăng xuất.</p>
+      <label class="field"><span>Mật khẩu hiện tại</span><input class="input" type="password" id="pw-current" autocomplete="current-password"></label>
+      <label class="field"><span>Mật khẩu mới (ít nhất 8 ký tự)</span><input class="input" type="password" id="pw-new" autocomplete="new-password"></label>
+      <label class="field"><span>Nhập lại mật khẩu mới</span><input class="input" type="password" id="pw-confirm" autocomplete="new-password"></label>
+      <div class="form-error" id="pw-error" role="alert" hidden></div>
+      <div class="dialog-actions">
+        <button class="btn ghost" type="button" data-close>Hủy</button>
+        <button class="btn primary" type="submit">Lưu mật khẩu</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="dialog wide" id="users-dialog">
+    <div class="dialog-head">
+      <div>
+        <h2>Quản lý tài khoản</h2>
+        <p>Mỗi tài khoản có bộ tài liệu riêng, người khác không xem được.</p>
+      </div>
+      <button class="icon-btn" type="button" data-close aria-label="Đóng">
+        <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12" /></svg>
+      </button>
+    </div>
+    <form class="user-add" id="user-add-form" novalidate>
+      <input class="input" id="new-username" placeholder="Tên đăng nhập" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32">
+      <input class="input" id="new-password" type="password" placeholder="Mật khẩu (≥ 8 ký tự)" autocomplete="new-password">
+      <label class="check"><input type="checkbox" id="new-is-admin"> Admin</label>
+      <button class="btn primary small" type="submit">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>Thêm
+      </button>
+    </form>
+    <div class="form-error" id="user-add-error" role="alert" hidden></div>
+    <ul class="user-list" id="user-list"></ul>
+  </dialog>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
