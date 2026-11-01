@@ -1,7 +1,8 @@
 """API cho giao diện web: đăng nhập, quản lý tài khoản, bộ tài liệu, nạp tài liệu, hỏi đáp.
 
 Mỗi tài khoản chỉ thấy bộ tài liệu của mình. Admin thêm quản lý tài khoản, nhưng cũng không xem được
-tài liệu của người khác.
+tài liệu của người khác. Hỏi đáp diễn ra trong các cuộc trò chuyện của từng bộ tài liệu; server tự lưu
+câu hỏi và câu trả lời, nên lịch sử còn nguyên khi đổi trình duyệt hay máy.
 
 Thao tác chạy lâu (nạp tài liệu, re-index, trả lời) trả về NDJSON: mỗi dòng là một sự kiện JSON
 để giao diện hiện tiến trình ngay, dòng cuối là kết quả ({"type": "done"} / {"type": "answer"})
@@ -16,12 +17,13 @@ import threading
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .answer import Answer, answer_from_docs, answer_from_web
 from .auth import SESSION_COOKIE, Accounts, AuthError, TooManyAttempts
@@ -30,9 +32,10 @@ from .ingest import DuplicateError, EmbedModelMismatch, IngestResult, LoadError
 from .providers import MissingKeyError
 from .providers.base import QuotaExhaustedError
 from .services import Services, build_services
-from .store import Collection, User
+from .store import Collection, Conversation, User
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+TITLE_CHARS = 80
 OCR_PROGRESS = re.compile(r"OCR (\d+)/(\d+)")
 # Lỗi người dùng tự xử lý được: hiện nguyên thông báo, không kèm tên lớp lỗi.
 USER_ERRORS = (LoadError, DuplicateError, EmbedModelMismatch, MissingKeyError, QuotaExhaustedError)
@@ -68,27 +71,64 @@ class UrlList(BaseModel):
     urls: list[str]
 
 
-class Turn(BaseModel):
-    role: str
-    content: str
+class SavedSource(BaseModel):
+    n: int
+    title: str = ""
+    location: str = ""
+    excerpt: str = ""
+    url: str = ""
+
+
+class SavedOffer(BaseModel):
+    query: str = ""
+    state: Literal["open", "done", "declined", "expired"]
+
+
+class SavedMessage(BaseModel):
+    """Tin nhắn nhập từ lịch sử cũ lưu trong trình duyệt; trường lạ bị bỏ qua."""
+    role: Literal["user", "assistant"]
+    text: str = ""
+    kind: Literal["docs", "web", "error"] | None = None
+    coverage: Literal["full", "partial", "none"] | None = None
+    question: str | None = None
+    sources: list[SavedSource] | None = None
+    offer: SavedOffer | None = None
+
+
+class NewConversation(BaseModel):
+    title: str = ""
+    messages: list[SavedMessage] = Field(default=[], max_length=500)
 
 
 class Question(BaseModel):
     question: str
-    history: list[Turn] = []
 
 
-class WebQuestion(BaseModel):
-    question: str
-    query: str
+class WebQuery(BaseModel):
+    query: str = ""
 
 
 def friendly_error(e: Exception) -> str:
     return str(e) if isinstance(e, USER_ERRORS) else f"Lỗi {type(e).__name__}: {e}"
 
 
-def answer_json(ans: Answer) -> dict:
-    return {**asdict(ans), "offer_web": ans.offer_web}
+def conversation_title(text: str) -> str:
+    text = " ".join(text.split())
+    return (text[:TITLE_CHARS] + ("…" if len(text) > TITLE_CHARS else "")) or "Cuộc trò chuyện mới"
+
+
+def answer_message(ans: Answer) -> dict:
+    return {
+        "role": "assistant", "kind": ans.kind, "coverage": ans.coverage, "text": ans.text, "question": ans.question,
+        "sources": [asdict(s) for s in ans.sources],
+        "offer": {"query": ans.web_query, "state": "open"} if ans.offer_web else None,
+    }
+
+
+def history_of(messages: list[dict]) -> list[dict]:
+    """Các lượt hỏi đáp đã có (bỏ thông báo lỗi), để hiểu câu hỏi nối tiếp như "còn ô tô thì sao?"."""
+    return [{"role": m["role"], "content": m["text"]} for m in messages
+            if m.get("text") and (m["role"] == "user" or m.get("kind") in ("docs", "web"))]
 
 
 def user_json(user: User | None) -> dict | None:
@@ -367,37 +407,99 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
             raise HTTPException(400, "Chưa có link nào")
         return ingest_items([(u, lambda p, u=u: ingestor.ingest_url(cid, u, p)) for u in urls])
 
-    # ---------------- hỏi đáp ----------------
+    # ---------------- cuộc trò chuyện & hỏi đáp ----------------
 
-    @app.post("/api/collections/{cid}/ask")
-    def ask(cid: int, body: Question, user: User = Depends(current_user)):
+    def own_conversation(conv_id: int, user: User) -> Conversation:
+        db = svc().db
+        conv = db.get_conversation(conv_id)
+        if conv is None or db.get_collection(conv.collection_id).owner_id != user.id:
+            raise HTTPException(404, "Cuộc trò chuyện không tồn tại")
+        return conv
+
+    def offer_message(conv_id: int, mid: int) -> dict:
+        msg = svc().db.get_message(conv_id, mid)
+        if msg is None or not msg.get("offer"):
+            raise HTTPException(404, "Không có lời mời tìm trên internet này")
+        if msg["offer"]["state"] != "open":
+            raise HTTPException(409, "Lời mời tìm trên internet này đã đóng")
+        return msg
+
+    @app.get("/api/collections/{cid}/conversations")
+    def list_conversations(cid: int, user: User = Depends(current_user)):
         own_collection(cid, user)
+        return [asdict(c) for c in svc().db.list_conversations(cid)]
+
+    @app.post("/api/collections/{cid}/conversations", status_code=201)
+    def create_conversation(cid: int, body: NewConversation, user: User = Depends(current_user)):
+        own_collection(cid, user)
+        db = svc().db
+        conv = db.create_conversation(cid, conversation_title(body.title))
+        for m in body.messages:
+            db.add_message(conv.id, m.model_dump(exclude_none=True))
+        return asdict(db.get_conversation(conv.id))
+
+    @app.get("/api/conversations/{conv_id}")
+    def get_conversation(conv_id: int, user: User = Depends(current_user)):
+        conv = own_conversation(conv_id, user)
+        return {**asdict(conv), "messages": svc().db.list_messages(conv_id)}
+
+    @app.delete("/api/conversations/{conv_id}", status_code=204)
+    def delete_conversation(conv_id: int, user: User = Depends(current_user)):
+        own_conversation(conv_id, user)
+        svc().db.delete_conversation(conv_id)
+        return Response(status_code=204)
+
+    @app.post("/api/conversations/{conv_id}/ask")
+    def ask(conv_id: int, body: Question, user: User = Depends(current_user)):
+        conv = own_conversation(conv_id, user)
         s = svc()
-        if s.ingestor.needs_reindex(cid):
+        if s.ingestor.needs_reindex(conv.collection_id):
             raise HTTPException(409, "Bộ tài liệu cần re-index trước khi hỏi")
-        history = [t.model_dump() for t in body.history]
+        question = body.question.strip()
+        if not question:
+            raise HTTPException(400, "Câu hỏi trống")
+        history = history_of(s.db.list_messages(conv_id))
+        # Đã sang câu hỏi mới thì các lời mời tìm web trước đó hết hiệu lực.
+        s.db.set_offer_state(conv_id, "expired")
+        s.db.add_message(conv_id, {"role": "user", "text": question})
 
         def work(emit: Emit) -> dict:
-            ans = answer_from_docs(
-                s.llm, s.retriever, cid, body.question.strip(), history, s.settings.top_k, s.settings.min_similarity,
-                progress=lambda m: emit({"type": "status", "message": m}),
-            )
-            return {"type": "answer", "answer": answer_json(ans)}
+            try:
+                ans = answer_from_docs(
+                    s.llm, s.retriever, conv.collection_id, question, history, s.settings.top_k,
+                    s.settings.min_similarity, progress=lambda m: emit({"type": "status", "message": m}),
+                )
+            except Exception as e:
+                s.db.add_message(conv_id, {"role": "assistant", "kind": "error", "text": friendly_error(e),
+                                           "question": question})
+                raise
+            return {"type": "answer", "message": s.db.add_message(conv_id, answer_message(ans))}
 
         return stream(work)
 
-    @app.post("/api/web")
-    def web_search(body: WebQuestion, _: User = Depends(current_user)):
+    @app.post("/api/conversations/{conv_id}/messages/{mid}/web")
+    def web_search(conv_id: int, mid: int, body: WebQuery, user: User = Depends(current_user)):
+        own_conversation(conv_id, user)
         s = svc()
         if s.web is None:
             raise HTTPException(503, "Chưa có TAVILY_API_KEY trong file .env")
+        msg = offer_message(conv_id, mid)
+        query = body.query.strip() or msg["question"]
 
         def work(emit: Emit) -> dict:
-            ans = answer_from_web(s.llm, s.web, body.query.strip(), body.question.strip(),
+            ans = answer_from_web(s.llm, s.web, query, msg["question"],
                                   progress=lambda m: emit({"type": "status", "message": m}))
-            return {"type": "answer", "answer": answer_json(ans)}
+            s.db.set_offer_state(conv_id, "done", mid, query)
+            return {"type": "answer", "message": s.db.add_message(conv_id, answer_message(ans))}
 
         return stream(work)
+
+    @app.post("/api/conversations/{conv_id}/messages/{mid}/decline", status_code=204)
+    def decline_web(conv_id: int, mid: int, user: User = Depends(current_user)):
+        own_conversation(conv_id, user)
+        offer_message(conv_id, mid)
+        svc().db.set_offer_state(conv_id, "declined", mid)
+        return Response(status_code=204)
 
     # ---------------- giao diện ----------------
 

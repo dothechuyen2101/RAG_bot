@@ -19,6 +19,7 @@ const ICONS = {
   file: '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /></svg>',
   retry: '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>',
   key: '<svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4" /><path d="m11 12 9-9M17 6l3 3M15 8l2 2" /></svg>',
+  chat: '<svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>',
 };
 
 /** Tạo phần tử: el("div", {class: "x", text: "..."}, child1, child2). Không bao giờ nhận HTML từ dữ liệu. */
@@ -214,26 +215,22 @@ const state = {
   docs: [],
   docsLoading: false,
   pending: new Map(), // cid -> Map(label -> {message, ratio, error})
-  chats: new Map(), // cid -> danh sách tin nhắn
-  thinking: new Map(), // cid -> dòng trạng thái đang xử lý
+  // Lịch sử trò chuyện lưu trên server; ở đây chỉ là bản đã tải về.
+  convs: new Map(), // cid -> danh sách cuộc trò chuyện, mới nhất trước
+  openConv: new Map(), // cid -> id cuộc trò chuyện đang mở; null: cuộc mới chưa hỏi gì; chưa có: đang tải
+  chats: new Map(), // id cuộc trò chuyện -> danh sách tin nhắn
+  thinking: new Map(), // id cuộc trò chuyện -> dòng trạng thái đang xử lý
+  creating: new Set(), // cid đang tạo cuộc trò chuyện mới (chặn gửi trùng)
   flashDocs: new Set(),
 };
 
 const current = () => state.collections.find((c) => c.id === state.currentId) || null;
-// Lịch sử chat lưu trong trình duyệt, tách theo tài khoản để người dùng chung máy không thấy của nhau.
-const chatKey = (cid) => `ragbot.chat.${state.user?.username}.${cid}`;
 const collectionKey = () => `ragbot.collection.${state.user?.username}`;
-
-function messagesOf(cid) {
-  if (!state.chats.has(cid)) {
-    const msgs = store.get(chatKey(cid), []);
-    // Trang bị tải lại giữa lúc đang tìm web: mở lại lời mời thay vì kẹt ở "Đang tìm...".
-    for (const m of msgs) if (m.offer?.state === "searching") m.offer.state = "open";
-    state.chats.set(cid, msgs);
-  }
-  return state.chats.get(cid);
-}
-const saveChat = (cid) => store.set(chatKey(cid), messagesOf(cid).slice(-100));
+// Nhớ cuộc trò chuyện đang mở của từng bộ để tải lại trang vẫn ở đúng chỗ.
+const openConvKey = (cid) => `ragbot.conv.${state.user?.username}.${cid}`;
+const openConvId = () => state.openConv.get(state.currentId);
+const convsOf = (cid) => state.convs.get(cid) || [];
+const chatOf = (conv) => state.chats.get(conv) || [];
 const pendingOf = (cid) => {
   if (!state.pending.has(cid)) state.pending.set(cid, new Map());
   return state.pending.get(cid);
@@ -318,10 +315,22 @@ async function selectCollection(id) {
   state.currentId = id;
   store.set(collectionKey(), id);
   closeSidebar();
+  closeHistory();
   renderCollections();
+  await loadCurrent();
+}
+
+/** Tải tài liệu và lịch sử trò chuyện của bộ đang chọn, rồi vẽ lại khung chat một lần. */
+async function loadCurrent() {
+  const cid = state.currentId;
+  state.docs = [];
   renderHeader();
   renderMessages();
-  await loadDocs();
+  await Promise.all([loadDocs(), cid == null ? null : loadConversations(cid)]);
+  if (cid !== state.currentId) return;
+  renderHeader();
+  renderMessages();
+  refreshComposer();
 }
 
 async function createCollection(name) {
@@ -346,13 +355,13 @@ async function deleteCollection() {
   if (!ok) return;
   try {
     await api(`/api/collections/${col.id}`, { method: "DELETE" });
-    store.remove(chatKey(col.id));
-    state.chats.delete(col.id);
+    store.remove(openConvKey(col.id));
+    convsOf(col.id).forEach((c) => state.chats.delete(c.id));
+    state.convs.delete(col.id);
+    state.openConv.delete(col.id);
     state.currentId = null;
     await loadCollections();
-    renderHeader();
-    renderMessages();
-    await loadDocs();
+    await loadCurrent();
     toast("success", `Đã xóa bộ “${col.name}”`);
   } catch (e) {
     toast("error", e.message);
@@ -446,7 +455,7 @@ async function loadDocs() {
     renderDocs();
     renderHeader();
     refreshComposer();
-    if (state.currentId == null || !messagesOf(state.currentId).length) renderMessages();
+    if (!chatOf(openConvId()).length) renderMessages();
   }
 }
 
@@ -520,12 +529,18 @@ async function deleteDoc(d, row) {
 // ================= Header & banner =================
 function renderHeader() {
   const col = current();
+  const conv = col && convsOf(col.id).find((c) => c.id === openConvId());
   $("#collection-title").textContent = col ? col.name : "RAG Bot";
   $("#collection-sub").textContent = col
-    ? `${state.docs.length || col.documents} tài liệu · trả lời có trích dẫn nguồn`
+    ? `${state.docs.length || col.documents} tài liệu · ${conv ? conv.title : "trả lời có trích dẫn nguồn"}`
     : "Hỏi đáp theo tài liệu của bạn";
   $("#delete-collection-btn").hidden = !col;
-  $("#clear-chat-btn").hidden = !col || !messagesOf(col.id).length;
+  $("#new-chat-btn").hidden = !col || openConvId() == null;
+  const n = col ? convsOf(col.id).length : 0;
+  $("#history-btn").hidden = !n;
+  $("#history-count").textContent = n;
+  if (!n) closeHistory();
+  else if (!historyPanel.hidden) renderHistory();
   document.title = col ? `${col.name} · RAG Bot` : "RAG Bot";
 
   const banner = $("#reindex-banner");
@@ -600,10 +615,13 @@ function welcome() {
 
 function renderMessages() {
   const cid = state.currentId;
-  const msgs = cid ? messagesOf(cid) : [];
-  messagesBox.replaceChildren(...(msgs.length ? msgs.map((m) => messageEl(m, cid)) : [welcome()]));
-  if (cid && state.thinking.has(cid)) messagesBox.append(thinkingEl(state.thinking.get(cid)));
-  $("#clear-chat-btn").hidden = !cid || !msgs.length;
+  const conv = openConvId();
+  const loading = cid != null && (conv === undefined || (conv !== null && !state.chats.has(conv)));
+  const msgs = chatOf(conv);
+  messagesBox.replaceChildren(...(loading
+    ? [el("div", { class: "welcome" }, el("div", { class: "welcome-mark", icon: "bot" }))]
+    : msgs.length ? msgs.map((m) => messageEl(m, cid, conv)) : [welcome()]));
+  if (conv != null && state.thinking.has(conv)) messagesBox.append(thinkingEl(state.thinking.get(conv)));
   scrollToBottom(false);
 }
 
@@ -615,15 +633,18 @@ function thinkingEl(text) {
       el("span", { class: "status-text", text })));
 }
 
-function setThinking(cid, text) {
+function setThinking(conv, text) {
+  const shown = conv === openConvId();
   if (text == null) {
-    state.thinking.delete(cid);
-    if (cid === state.currentId) $("#thinking")?.remove();
+    state.thinking.delete(conv);
+    if (shown) $("#thinking")?.remove();
+    if (!historyPanel.hidden) renderHistory();
     return;
   }
-  const isNew = !state.thinking.has(cid);
-  state.thinking.set(cid, text);
-  if (cid !== state.currentId) return;
+  const isNew = !state.thinking.has(conv);
+  state.thinking.set(conv, text);
+  if (isNew && !historyPanel.hidden) renderHistory();
+  if (!shown) return;
   const node = $("#thinking");
   if (isNew || !node) {
     messagesBox.append(thinkingEl(text));
@@ -638,7 +659,7 @@ function setThinking(cid, text) {
   }, reduceMotion.matches ? 0 : 180);
 }
 
-function messageEl(m, cid) {
+function messageEl(m, cid, conv) {
   if (m.role === "user") return el("div", { class: "msg user" }, el("div", { class: "bubble", text: m.text }));
 
   const kindClass = m.kind === "web" ? "web" : m.kind === "error" ? "error" : "";
@@ -659,7 +680,7 @@ function messageEl(m, cid) {
   body.append(content);
 
   if (m.sources?.length) body.append(sourcesEl(m, cid));
-  if (m.offer) body.append(offerEl(m, cid));
+  if (m.offer) body.append(offerEl(m, cid, conv));
   return node;
 }
 
@@ -679,7 +700,7 @@ function sourcesEl(m, cid) {
         : document.createTextNode(s.title);
       const excerpt = el("div", { class: "source-excerpt", text: s.excerpt, title: "Bấm để xem đầy đủ" });
       excerpt.addEventListener("click", () => excerpt.classList.toggle("expanded"));
-      const actions = s.url ? el("div", { class: "source-actions" }, addSourceButton(m, s, cid)) : null;
+      const actions = s.url ? el("div", { class: "source-actions" }, addSourceButton(s, cid)) : null;
       return el("div", { class: "source-card", "data-n": s.n, style: `--i:${i}` },
         el("span", { class: "source-num", text: s.n }),
         el("div", { class: "source-body" },
@@ -692,16 +713,16 @@ function sourcesEl(m, cid) {
   return wrap;
 }
 
-function addSourceButton(m, s, cid) {
-  const btn = el("button", { class: "btn ghost small", type: "button", icon: s.added ? "check" : "plus", disabled: s.added },
-    s.added ? "Đã thêm vào bộ tài liệu" : "Thêm vào bộ tài liệu");
+function addSourceButton(s, cid) {
+  // Trang web nạp vào bộ tài liệu được lưu với nguồn là chính link đó.
+  const added = state.docs.some((d) => d.source === s.url);
+  const btn = el("button", { class: "btn ghost small", type: "button", icon: added ? "check" : "plus", disabled: added },
+    added ? "Đã thêm vào bộ tài liệu" : "Thêm vào bộ tài liệu");
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     btn.lastChild.textContent = "Đang thêm...";
     const ok = await ingest("urls", [s.url], cid);
     if (ok) {
-      s.added = true;
-      saveChat(cid);
       btn.replaceChildren();
       btn.insertAdjacentHTML("afterbegin", ICONS.check);
       btn.append("Đã thêm vào bộ tài liệu");
@@ -713,7 +734,7 @@ function addSourceButton(m, s, cid) {
   return btn;
 }
 
-function offerEl(m, cid) {
+function offerEl(m, cid, conv) {
   const offer = m.offer;
   if (offer.state === "done") return el("div", { class: "offer-done", icon: "check" }, "Đã tìm trên internet");
   if (offer.state === "declined" || offer.state === "expired") return el("div", { class: "offer-done", icon: "x" }, "Đã bỏ qua, không tìm trên internet");
@@ -721,16 +742,20 @@ function offerEl(m, cid) {
   const searching = offer.state === "searching";
   const webOn = state.info?.web_search;
   const input = el("input", { value: offer.query, "aria-label": "Truy vấn tìm kiếm", disabled: searching });
-  input.addEventListener("input", () => { offer.query = input.value; saveChat(cid); });
+  input.addEventListener("input", () => { offer.query = input.value; });
   input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); yes.click(); } });
   const yes = el("button", { class: "btn primary small", type: "button", icon: "globe", disabled: searching || !webOn },
     searching ? "Đang tìm..." : "Tìm trên internet");
   const no = el("button", { class: "btn ghost small", type: "button", disabled: searching }, "Không, cảm ơn");
-  yes.addEventListener("click", () => webSearch(m, cid));
-  no.addEventListener("click", () => {
+  yes.addEventListener("click", () => webSearch(m, cid, conv));
+  no.addEventListener("click", async () => {
     offer.state = "declined";
-    saveChat(cid);
-    rerenderMessage(m, cid);
+    rerenderMessage(m, cid, conv);
+    try {
+      await api(`/api/conversations/${conv}/messages/${m.id}/decline`, { method: "POST" });
+    } catch (e) {
+      toast("error", e.message);
+    }
   });
   const partial = m.coverage === "partial";
   return el("div", { class: "offer" },
@@ -744,18 +769,18 @@ function offerEl(m, cid) {
     webOn ? null : el("div", { class: "offer-note", text: "Chưa có TAVILY_API_KEY trong file .env nên chưa tìm web được." }));
 }
 
-function rerenderMessage(m, cid) {
-  if (cid !== state.currentId) return;
+function rerenderMessage(m, cid, conv) {
+  if (conv !== openConvId()) return;
   const old = messagesBox.querySelector(`[data-id="${m.id}"]`);
   if (!old) return;
-  const fresh = messageEl(m, cid);
+  const fresh = messageEl(m, cid, conv);
   fresh.style.animation = "none";
   old.replaceWith(fresh);
 }
 
 /** Hiện câu trả lời dần dần như đang gõ, rồi mới hiện nguồn và lời mời tìm web. */
-function typewrite(m, cid) {
-  const node = messageEl(m, cid);
+function typewrite(m, cid, conv) {
+  const node = messageEl(m, cid, conv);
   messagesBox.append(node);
   const content = node.querySelector(".md");
   const extras = [...node.querySelectorAll(".sources, .offer")];
@@ -793,84 +818,251 @@ function typewrite(m, cid) {
   requestAnimationFrame(frame);
 }
 
-function pushMessage(cid, m, { animate = true } = {}) {
-  messagesOf(cid).push(m);
-  saveChat(cid);
-  if (cid !== state.currentId) return;
+function pushMessage(conv, m) {
+  if (!state.chats.has(conv)) state.chats.set(conv, []);
+  state.chats.get(conv).push(m);
+  if (conv !== openConvId()) return;
   if (!messagesBox.querySelector(".msg")) messagesBox.replaceChildren();
   $("#thinking")?.remove();
-  if (m.role === "assistant" && animate) typewrite(m, cid);
+  if (m.role === "assistant") typewrite(m, state.currentId, conv);
   else {
-    messagesBox.append(messageEl(m, cid));
+    messagesBox.append(messageEl(m, state.currentId, conv));
     scrollToBottom();
   }
-  if (state.thinking.has(cid)) messagesBox.append(thinkingEl(state.thinking.get(cid)));
-  $("#clear-chat-btn").hidden = false;
+  if (state.thinking.has(conv)) messagesBox.append(thinkingEl(state.thinking.get(conv)));
 }
 
-function historyFor(cid) {
-  return messagesOf(cid)
-    .filter((m) => m.text && (m.role === "user" || m.kind === "docs" || m.kind === "web"))
-    .slice(-6)
-    .map((m) => ({ role: m.role, content: m.text }));
-}
-
-function answerMessage(a, question) {
-  return {
-    id: uid(), role: "assistant", kind: a.kind, coverage: a.coverage, text: a.text, question: a.question || question,
-    sources: a.sources, offer: a.offer_web ? { query: a.web_query, state: "open" } : null,
-  };
-}
+const localId = () => `local-${uid()}`;
 
 async function askQuestion(text) {
   const cid = state.currentId;
   const question = text.trim();
-  if (!cid || !question || state.thinking.has(cid)) return;
-  const history = historyFor(cid);
-  for (const m of messagesOf(cid)) if (m.offer?.state === "open") m.offer.state = "expired";
-  if (cid === state.currentId) messagesBox.querySelectorAll(".offer").forEach((o) => {
-    const msg = messagesOf(cid).find((m) => m.id === o.closest(".msg")?.dataset.id);
-    if (msg) rerenderMessage(msg, cid);
-  });
-  pushMessage(cid, { id: uid(), role: "user", text: question });
-  setThinking(cid, "Đang đọc câu hỏi...");
+  let conv = openConvId();
+  if (!cid || !question || conv === undefined || state.thinking.has(conv) || state.creating.has(cid)) return;
+  if (conv === null) {
+    // Câu hỏi đầu tiên: tạo cuộc trò chuyện trên server, lấy câu hỏi làm tên.
+    state.creating.add(cid);
+    refreshComposer();
+    try {
+      conv = (await createConversation(cid, question)).id;
+      state.chats.set(conv, []);
+    } catch (e) {
+      toast("error", e.message);
+      return;
+    } finally {
+      state.creating.delete(cid);
+      refreshComposer();
+    }
+    if (state.openConv.get(cid) === null) setOpenConv(cid, conv);
+    if (cid === state.currentId) renderHeader();
+  }
+  // Server cũng đóng các lời mời tìm web cũ khi nhận câu hỏi mới.
+  for (const m of chatOf(conv)) {
+    if (m.offer?.state === "open") {
+      m.offer.state = "expired";
+      rerenderMessage(m, cid, conv);
+    }
+  }
+  pushMessage(conv, { id: localId(), role: "user", text: question });
+  setThinking(conv, "Đang đọc câu hỏi...");
   refreshComposer();
   try {
-    const result = await stream(`/api/collections/${cid}/ask`, jsonInit({ question, history }), (ev) => {
-      if (ev.type === "status") setThinking(cid, ev.message);
+    const result = await stream(`/api/conversations/${conv}/ask`, jsonInit({ question }), (ev) => {
+      if (ev.type === "status") setThinking(conv, ev.message);
     });
-    setThinking(cid, null);
-    pushMessage(cid, answerMessage(result.answer, question));
+    setThinking(conv, null);
+    pushMessage(conv, result.message);
   } catch (e) {
-    setThinking(cid, null);
-    pushMessage(cid, { id: uid(), role: "assistant", kind: "error", text: e.message, question });
+    setThinking(conv, null);
+    pushMessage(conv, { id: localId(), role: "assistant", kind: "error", text: e.message, question });
   }
   refreshComposer();
+  refreshConversations(cid);
 }
 
-async function webSearch(m, cid) {
+async function webSearch(m, cid, conv) {
   const query = (m.offer.query || "").trim() || m.question;
   m.offer.state = "searching";
-  rerenderMessage(m, cid);
-  setThinking(cid, "Đang tìm trên internet...");
+  rerenderMessage(m, cid, conv);
+  setThinking(conv, "Đang tìm trên internet...");
   refreshComposer();
   try {
-    const result = await stream("/api/web", jsonInit({ question: m.question, query }), (ev) => {
-      if (ev.type === "status") setThinking(cid, ev.message);
+    const result = await stream(`/api/conversations/${conv}/messages/${m.id}/web`, jsonInit({ query }), (ev) => {
+      if (ev.type === "status") setThinking(conv, ev.message);
     });
-    m.offer.state = "done";
-    rerenderMessage(m, cid);
-    setThinking(cid, null);
-    pushMessage(cid, answerMessage(result.answer, m.question));
+    Object.assign(m.offer, { state: "done", query });
+    rerenderMessage(m, cid, conv);
+    setThinking(conv, null);
+    pushMessage(conv, result.message);
   } catch (e) {
     m.offer.state = "open";
-    rerenderMessage(m, cid);
-    setThinking(cid, null);
+    rerenderMessage(m, cid, conv);
+    setThinking(conv, null);
     toast("error", e.message, 7000);
   }
-  saveChat(cid);
   refreshComposer();
+  refreshConversations(cid);
 }
+
+// ================= Lịch sử trò chuyện =================
+const historyPanel = $("#history-panel");
+const historyBtn = $("#history-btn");
+
+function setOpenConv(cid, conv) {
+  state.openConv.set(cid, conv);
+  store.set(openConvKey(cid), conv);
+}
+
+async function createConversation(cid, title, messages = []) {
+  const conv = await api(`/api/collections/${cid}/conversations`, { method: "POST", body: { title, messages } });
+  state.convs.set(cid, [conv, ...convsOf(cid)]);
+  return conv;
+}
+
+/** Lịch sử cũ chỉ nằm trong trình duyệt (trước khi lưu trên server): chuyển lên server một lần. */
+async function importBrowserHistory(cid) {
+  const keys = [`ragbot.chat.${state.user.username}.${cid}`];
+  // Từ trước khi có đăng nhập; các bộ tài liệu thời đó đã thuộc về admin đầu tiên.
+  if (state.user.is_admin) keys.push(`ragbot.chat.${cid}`);
+  for (const key of keys) {
+    const msgs = store.get(key, null);
+    if (!Array.isArray(msgs)) continue;
+    if (msgs.length) {
+      const messages = msgs.map((m) => (m.offer?.state === "searching" ? { ...m, offer: { ...m.offer, state: "open" } } : m));
+      await createConversation(cid, msgs.find((m) => m.role === "user")?.text || "", messages);
+    }
+    store.remove(key);
+  }
+}
+
+/** Tải danh sách cuộc trò chuyện của bộ và tin nhắn của cuộc đang mở (lần đầu: cuộc gần nhất). */
+async function loadConversations(cid) {
+  try {
+    await importBrowserHistory(cid);
+    const list = await api(`/api/collections/${cid}/conversations`);
+    state.convs.set(cid, list);
+    let conv = state.openConv.has(cid) ? state.openConv.get(cid) : store.get(openConvKey(cid), undefined);
+    if (conv === undefined || (conv !== null && !list.some((c) => c.id === conv))) conv = list[0]?.id ?? null;
+    if (conv !== null && !state.chats.has(conv)) state.chats.set(conv, (await api(`/api/conversations/${conv}`)).messages);
+    state.openConv.set(cid, conv);
+  } catch (e) {
+    toast("error", e.message);
+    if (!state.openConv.has(cid)) state.openConv.set(cid, null);
+  }
+}
+
+/** Cập nhật thứ tự và số tin nhắn trong danh sách sau khi hỏi xong. */
+async function refreshConversations(cid) {
+  try {
+    state.convs.set(cid, await api(`/api/collections/${cid}/conversations`));
+  } catch {
+    return;
+  }
+  if (cid === state.currentId) renderHeader();
+}
+
+async function openConversation(cid, conv) {
+  closeHistory();
+  setOpenConv(cid, conv);
+  renderHeader();
+  renderMessages();
+  refreshComposer();
+  if (conv !== null && !state.chats.has(conv)) {
+    try {
+      state.chats.set(conv, (await api(`/api/conversations/${conv}`)).messages);
+    } catch (e) {
+      toast("error", e.message);
+      setOpenConv(cid, null);
+    }
+    if (cid !== state.currentId) return;
+    renderHeader();
+    renderMessages();
+    refreshComposer();
+  }
+  textarea.focus();
+}
+
+async function deleteConversation(cid, c, row) {
+  const ok = await confirmDialog("Xóa cuộc trò chuyện?", `“${c.title}” cùng toàn bộ tin nhắn trong đó sẽ bị xóa vĩnh viễn.`);
+  if (!ok) return;
+  try {
+    await api(`/api/conversations/${c.id}`, { method: "DELETE" });
+  } catch (e) {
+    return toast("error", e.message);
+  }
+  row.classList.add("removing");
+  await new Promise((r) => setTimeout(r, reduceMotion.matches ? 0 : 260));
+  state.convs.set(cid, convsOf(cid).filter((x) => x.id !== c.id));
+  state.chats.delete(c.id);
+  if (state.openConv.get(cid) === c.id) {
+    setOpenConv(cid, null);
+    if (cid === state.currentId) renderMessages();
+  }
+  if (cid === state.currentId) {
+    renderHeader();
+    refreshComposer();
+  }
+  toast("success", "Đã xóa cuộc trò chuyện");
+}
+
+function timeAgo(s) {
+  const d = new Date(String(s).replace(" ", "T") + "Z");
+  const minutes = (Date.now() - d.getTime()) / 60000;
+  if (Number.isNaN(minutes)) return "";
+  if (minutes < 1) return "vừa xong";
+  if (minutes < 60) return `${Math.floor(minutes)} phút trước`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} giờ trước`;
+  if (minutes < 7 * 24 * 60) return `${Math.floor(minutes / 1440)} ngày trước`;
+  return d.toLocaleDateString("vi-VN");
+}
+
+function renderHistory() {
+  const cid = state.currentId;
+  const open = openConvId();
+  const list = convsOf(cid);
+  $("#history-sub").textContent = `${list.length} cuộc`;
+  $("#history-list").replaceChildren(...list.map((c, i) => {
+    const busy = state.thinking.has(c.id);
+    const row = el("li", { class: `history-item ${c.id === open ? "active" : ""}`, style: `animation-delay:${Math.min(i, 10) * 25}ms` });
+    row.append(
+      el("button", { class: "history-open", type: "button", onclick: () => openConversation(cid, c.id) },
+        el("span", { class: "h-title", text: c.title, title: c.title }),
+        el("span", { class: "h-meta" },
+          busy ? el("span", { class: "h-live", text: "Đang trả lời" }) : null,
+          `${timeAgo(c.updated_at)} · ${c.n_messages} tin nhắn`)),
+      el("button", { class: "icon-btn small danger-hover", type: "button", icon: "trash", title: "Xóa cuộc trò chuyện",
+        "aria-label": `Xóa cuộc trò chuyện ${c.title}`, disabled: busy, onclick: () => deleteConversation(cid, c, row) }),
+    );
+    return row;
+  }));
+}
+
+function closeHistory() {
+  historyPanel.hidden = true;
+  historyBtn.setAttribute("aria-expanded", "false");
+}
+
+historyBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!historyPanel.hidden) return closeHistory();
+  renderHistory();
+  historyPanel.hidden = false;
+  historyBtn.setAttribute("aria-expanded", "true");
+  historyPanel.querySelector(".history-item.active .history-open, .history-open")?.focus();
+});
+document.addEventListener("click", (e) => {
+  // Bấm trong hộp thoại xác nhận xóa không tính là bấm ra ngoài.
+  if (!historyPanel.hidden && !historyPanel.contains(e.target) && !e.target.closest("dialog")) closeHistory();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !historyPanel.hidden && !document.querySelector("dialog[open]")) {
+    closeHistory();
+    historyBtn.focus();
+  }
+});
+$("#new-chat-btn").addEventListener("click", () => {
+  if (state.currentId != null) openConversation(state.currentId, null);
+});
 
 // Bấm số trích dẫn [n]: mở danh sách nguồn, cuộn tới thẻ nguồn và làm nó sáng lên.
 messagesBox.addEventListener("click", (e) => {
@@ -896,7 +1088,7 @@ const sendBtn = $("#send-btn");
 
 function refreshComposer() {
   const col = current();
-  const busy = col && state.thinking.has(col.id);
+  const busy = col && (state.thinking.has(openConvId()) || state.creating.has(col.id));
   const ready = col && !col.needs_reindex && state.docs.length > 0;
   textarea.disabled = !ready;
   textarea.placeholder = !col
@@ -1009,14 +1201,6 @@ $("#theme-toggle").addEventListener("click", () => {
   } catch {}
 });
 
-$("#clear-chat-btn").addEventListener("click", () => {
-  const cid = state.currentId;
-  if (!cid || state.thinking.has(cid)) return;
-  state.chats.set(cid, []);
-  saveChat(cid);
-  renderMessages();
-  textarea.focus();
-});
 $("#delete-collection-btn").addEventListener("click", deleteCollection);
 $("#reindex-btn").addEventListener("click", reindex);
 
@@ -1089,11 +1273,10 @@ function onUnauthorized() {
 
 function resetApp() {
   Object.assign(state, { user: null, info: null, collections: [], currentId: null, docs: [] });
-  state.pending.clear();
-  state.chats.clear();
-  state.thinking.clear();
+  [state.pending, state.convs, state.openConv, state.chats, state.thinking, state.creating].forEach((m) => m.clear());
   messagesBox.replaceChildren();
   closeUserMenu();
+  closeHistory();
 }
 
 function renderUser() {
@@ -1123,9 +1306,7 @@ async function startApp(user) {
       el("p", { text: e.message })));
     return;
   }
-  renderHeader();
-  renderMessages();
-  await loadDocs();
+  await loadCurrent();
   textarea.focus();
 }
 

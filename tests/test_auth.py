@@ -1,5 +1,6 @@
 """Đăng nhập, phân quyền và tách dữ liệu giữa các tài khoản."""
 
+import json
 import sqlite3
 
 import pytest
@@ -79,7 +80,8 @@ def test_remote_first_setup_blocked(svc):
 def test_protected_endpoints_require_login(svc, admin):
     anon = client_for(svc)
     for method, path in [("get", "/api/info"), ("get", "/api/collections"), ("post", "/api/collections"),
-                         ("get", "/api/collections/1/documents"), ("post", "/api/web"), ("get", "/api/users")]:
+                         ("get", "/api/collections/1/documents"), ("get", "/api/collections/1/conversations"),
+                         ("get", "/api/conversations/1"), ("post", "/api/conversations/1/ask"), ("get", "/api/users")]:
         r = getattr(anon, method)(path, json={}) if method == "post" else anon.get(path)
         assert r.status_code == 401, (path, r.status_code)
     assert anon.get("/").status_code == 200  # trang giao diện (màn hình đăng nhập) vẫn mở được
@@ -135,6 +137,9 @@ def test_collections_are_private_per_user(svc, admin):
     mine = admin.post("/api/collections", json={"name": "Pháp luật"}).json()["id"]
     events = admin.post(f"/api/collections/{mine}/files", files=[("files", ("nd.txt", LEGAL_TEXT.encode(), "text/plain"))])
     doc_id = [line for line in events.text.splitlines() if '"item_done"' in line][0].split('"id": "')[1].split('"')[0]
+    conv = admin.post(f"/api/collections/{mine}/conversations", json={"title": "Riêng tư"}).json()["id"]
+    offer = admin.post(f"/api/conversations/{conv}/ask", json={"question": "Phạt?"}).text.splitlines()[-1]
+    offer_id = json.loads(offer)["message"]["id"]
 
     # Cùng tên bộ tài liệu vẫn được, vì mỗi người một không gian riêng.
     theirs = binh.post("/api/collections", json={"name": "Pháp luật"})
@@ -144,7 +149,13 @@ def test_collections_are_private_per_user(svc, admin):
 
     for method, path, kwargs in [
         ("get", f"/api/collections/{mine}/documents", {}),
-        ("post", f"/api/collections/{mine}/ask", {"json": {"question": "Phạt?"}}),
+        ("get", f"/api/collections/{mine}/conversations", {}),
+        ("post", f"/api/collections/{mine}/conversations", {"json": {"title": "x"}}),
+        ("get", f"/api/conversations/{conv}", {}),
+        ("post", f"/api/conversations/{conv}/ask", {"json": {"question": "Phạt?"}}),
+        ("post", f"/api/conversations/{conv}/messages/{offer_id}/decline", {}),
+        ("post", f"/api/conversations/{conv}/messages/{offer_id}/web", {"json": {"query": "x"}}),
+        ("delete", f"/api/conversations/{conv}", {}),
         ("post", f"/api/collections/{mine}/urls", {"json": {"urls": ["https://a.vn"]}}),
         ("post", f"/api/collections/{mine}/reindex", {}),
         ("delete", f"/api/collections/{mine}/documents/{doc_id}", {}),
@@ -155,6 +166,7 @@ def test_collections_are_private_per_user(svc, admin):
     theirs_id = theirs.json()["id"]
     assert binh.delete(f"/api/collections/{theirs_id}/documents/{doc_id}").status_code == 404
     assert len(admin.get(f"/api/collections/{mine}/documents").json()) == 1
+    assert admin.get(f"/api/conversations/{conv}").json()["n_messages"] == 2
 
 
 def test_delete_user_removes_their_data(svc, admin, tmp_path):

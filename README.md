@@ -47,7 +47,9 @@ Mở http://localhost:8000 rồi làm theo các bước:
 5. Nếu tài liệu không có (hoặc chỉ có một phần) câu trả lời, bot hiện thẻ hỏi ý kiến: sửa truy vấn nếu cần rồi bấm
    **Tìm trên internet**, hoặc **Không, cảm ơn**. Trang web tìm được có thể đưa vào bộ tài liệu bằng nút **Thêm vào bộ tài liệu**.
 
-Giao diện tự theo chế độ sáng/tối của hệ điều hành, đổi bằng nút ở góc dưới thanh bên trái. Lịch sử hội thoại lưu trong trình duyệt, theo từng tài khoản và bộ tài liệu.
+Giao diện tự theo chế độ sáng/tối của hệ điều hành, đổi bằng nút ở góc dưới thanh bên trái.
+
+Lịch sử trò chuyện lưu trên server, nên đổi trình duyệt hay máy khác vẫn còn. Mỗi bộ tài liệu có nhiều cuộc trò chuyện: nút **Hội thoại mới** bắt đầu cuộc mới (cuộc cũ vẫn giữ), nút **Lịch sử** để mở lại hoặc xóa cuộc cũ. Lịch sử từ phiên bản cũ (chỉ nằm trong trình duyệt) được tự chuyển lên server ở lần mở đầu tiên.
 Muốn mở từ máy khác trong mạng LAN: `.venv/bin/python server.py --host 0.0.0.0`.
 
 ## Đăng nhập & tài khoản
@@ -127,7 +129,7 @@ WELLFLOW_FALLBACK_MODELS=claude-sonnet-5-5,claude-haiku-5.5
 Mọi thứ nằm trong thư mục `data/` (không đưa vào git):
 
 ```
-data/ragbot.db   tài khoản, phiên đăng nhập, danh mục bộ tài liệu, tài liệu, chỉ mục từ khóa (SQLite FTS5)
+data/ragbot.db   tài khoản, phiên đăng nhập, bộ tài liệu, tài liệu, lịch sử trò chuyện, chỉ mục từ khóa (SQLite FTS5)
 data/chroma/     vector embedding (ChromaDB)
 data/files/      file gốc đã upload
 data/texts/      văn bản đã trích (kể cả kết quả OCR), dùng khi re-index

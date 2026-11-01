@@ -1,4 +1,4 @@
-from .db import Collection, Database, Document, User
+from .db import Collection, Conversation, Database, Document, User
 from .vector import StoredChunk, VectorStore
 
-__all__ = ["Collection", "Database", "Document", "StoredChunk", "User", "VectorStore"]
+__all__ = ["Collection", "Conversation", "Database", "Document", "StoredChunk", "User", "VectorStore"]

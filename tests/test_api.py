@@ -107,44 +107,116 @@ def test_add_urls_reports_per_item_errors(ctx, monkeypatch):
     assert client.post(f"/api/collections/{cid}/urls", json={"urls": [" "]}).status_code == 400
 
 
+def new_conversation(client, cid, title="Phạt xe máy?") -> int:
+    resp = client.post(f"/api/collections/{cid}/conversations", json={"title": title})
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def ask(client, conv, question):
+    return events(client.post(f"/api/conversations/{conv}/ask", json={"question": question}))
+
+
 def test_ask_not_found_offers_web_without_searching(ctx):
     client, svc, cid = ctx
     _upload_legal(client, cid)
-    evs = events(client.post(f"/api/collections/{cid}/ask", json={"question": "Phạt xe máy?", "history": []}))
+    evs = ask(client, new_conversation(client, cid), "Phạt xe máy?")
     assert any(e["type"] == "status" for e in evs)
-    answer = evs[-1]["answer"]
-    assert evs[-1]["type"] == "answer" and answer["coverage"] == "none" and answer["offer_web"] is True
-    assert answer["web_query"] == "mức phạt xe máy"
+    msg = evs[-1]["message"]
+    assert evs[-1]["type"] == "answer" and msg["coverage"] == "none"
+    assert msg["offer"] == {"query": "mức phạt xe máy", "state": "open"}
     assert svc.web.queries == []
 
 
-def test_ask_full_answer_with_sources(ctx):
+def test_conversation_history_saved_on_server(ctx):
     client, svc, cid = ctx
     _upload_legal(client, cid)
     svc.llm.json_result = {"coverage": "full", "answer": "Phạt 6-8 triệu [1].", "citations": [1], "web_query": ""}
-    history = [{"role": "user", "content": "Câu trước"}, {"role": "assistant", "content": "Trả lời trước"}]
-    evs = events(client.post(f"/api/collections/{cid}/ask", json={"question": "còn ô tô?", "history": history}))
-    answer = evs[-1]["answer"]
-    assert answer["offer_web"] is False and answer["sources"][0]["n"] == 1
-    assert "Đang hiểu câu hỏi" in evs[0]["message"]  # có lịch sử nên có bước viết lại câu hỏi
+    conv = new_conversation(client, cid, "  Mức phạt   nồng độ cồn " + "x" * 100)
+    first = ask(client, conv, "Phạt nồng độ cồn?")
+    assert not any("Đang hiểu câu hỏi" in e.get("message", "") for e in first)
+    assert first[-1]["message"]["sources"][0]["n"] == 1
+
+    # Câu hỏi nối tiếp: server tự lấy lịch sử đã lưu để viết lại câu hỏi.
+    second = ask(client, conv, "còn ô tô?")
+    assert "Đang hiểu câu hỏi" in second[0]["message"]
+    assert "Phạt nồng độ cồn?" in svc.llm.complete_calls[-1] and "Phạt 6-8 triệu" in svc.llm.complete_calls[-1]
+
+    saved = client.get(f"/api/conversations/{conv}").json()
+    assert [(m["role"], m["text"]) for m in saved["messages"]] == [
+        ("user", "Phạt nồng độ cồn?"), ("assistant", "Phạt 6-8 triệu [1]."),
+        ("user", "còn ô tô?"), ("assistant", "Phạt 6-8 triệu [1]."),
+    ]
+    assert saved["messages"][1]["sources"][0]["title"] == "nd100"
+    listed = client.get(f"/api/collections/{cid}/conversations").json()
+    assert [(c["id"], c["n_messages"]) for c in listed] == [(conv, 4)]
+    assert listed[0]["title"].startswith("Mức phạt nồng độ cồn x") and listed[0]["title"].endswith("…")
 
 
-def test_web_search(ctx):
-    client, svc, _ = ctx
-    evs = events(client.post("/api/web", json={"question": "Phạt xe máy?", "query": "phạt xe máy 2026"}))
+def test_conversations_listed_newest_first_and_deleted(ctx):
+    client, _, cid = ctx
+    _upload_legal(client, cid)
+    old, new = new_conversation(client, cid, "Cũ"), new_conversation(client, cid, "Mới")
+    assert [c["title"] for c in client.get(f"/api/collections/{cid}/conversations").json()] == ["Mới", "Cũ"]
+    assert client.post(f"/api/collections/{cid}/conversations", json={}).json()["title"] == "Cuộc trò chuyện mới"
+
+    assert client.delete(f"/api/conversations/{old}").status_code == 204
+    assert client.get(f"/api/conversations/{old}").status_code == 404
+    assert new in [c["id"] for c in client.get(f"/api/collections/{cid}/conversations").json()]
+
+
+def test_new_question_expires_open_web_offer(ctx):
+    client, _, cid = ctx
+    _upload_legal(client, cid)
+    conv = new_conversation(client, cid)
+    offer_id = ask(client, conv, "Phạt xe máy?")[-1]["message"]["id"]
+    ask(client, conv, "Còn xe đạp?")
+    states = [m["offer"]["state"] for m in client.get(f"/api/conversations/{conv}").json()["messages"] if m.get("offer")]
+    assert states == ["expired", "open"]
+    assert client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={"query": "x"}).status_code == 409
+
+
+def test_web_search_after_user_agrees(ctx):
+    client, svc, cid = ctx
+    _upload_legal(client, cid)
+    conv = new_conversation(client, cid)
+    offer_id = ask(client, conv, "Phạt xe máy?")[-1]["message"]["id"]
+    evs = events(client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={"query": "phạt xe máy 2026"}))
     assert svc.web.queries == ["phạt xe máy 2026"]
-    answer = evs[-1]["answer"]
-    assert answer["kind"] == "web" and answer["sources"][0]["url"] == "https://chinhphu.vn/x"
+    msg = evs[-1]["message"]
+    assert msg["kind"] == "web" and msg["sources"][0]["url"] == "https://chinhphu.vn/x" and msg["offer"] is None
+
+    saved = client.get(f"/api/conversations/{conv}").json()["messages"]
+    assert saved[1]["offer"] == {"query": "phạt xe máy 2026", "state": "done"} and saved[2]["kind"] == "web"
+    # Lời mời đã dùng thì không tìm lại được.
+    assert client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={}).status_code == 409
+
+
+def test_decline_web_offer(ctx):
+    client, svc, cid = ctx
+    _upload_legal(client, cid)
+    conv = new_conversation(client, cid)
+    offer_id = ask(client, conv, "Phạt?")[-1]["message"]["id"]
+    assert client.post(f"/api/conversations/{conv}/messages/{offer_id}/decline").status_code == 204
+    question, offer = client.get(f"/api/conversations/{conv}").json()["messages"]
+    assert offer["offer"]["state"] == "declined"
+    assert client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={}).status_code == 409
+    # Tin nhắn không có lời mời tìm web.
+    assert client.post(f"/api/conversations/{conv}/messages/{question['id']}/decline").status_code == 404
+    assert svc.web.queries == []
 
 
 def test_web_search_without_tavily_key(ctx):
-    client, svc, _ = ctx
+    client, svc, cid = ctx
+    _upload_legal(client, cid)
+    conv = new_conversation(client, cid)
+    offer_id = ask(client, conv, "Phạt?")[-1]["message"]["id"]
     svc.web = None
-    resp = client.post("/api/web", json={"question": "q", "query": "q"})
+    resp = client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={"query": "q"})
     assert resp.status_code == 503 and "TAVILY_API_KEY" in resp.json()["detail"]
 
 
-def test_llm_error_is_streamed_as_error_event(ctx):
+def test_llm_error_is_streamed_and_saved(ctx):
     client, svc, cid = ctx
     _upload_legal(client, cid)
 
@@ -152,8 +224,37 @@ def test_llm_error_is_streamed_as_error_event(ctx):
         raise MissingKeyError("Chưa có WELLFLOW_API_KEY trong file .env")
 
     svc.llm.complete_json = boom
-    evs = events(client.post(f"/api/collections/{cid}/ask", json={"question": "Phạt?"}))
+    conv = new_conversation(client, cid)
+    evs = ask(client, conv, "Phạt?")
     assert evs[-1] == {"type": "error", "message": "Chưa có WELLFLOW_API_KEY trong file .env"}
+    saved = client.get(f"/api/conversations/{conv}").json()["messages"]
+    assert saved[-1] == {"id": saved[-1]["id"], "role": "assistant", "kind": "error",
+                         "text": "Chưa có WELLFLOW_API_KEY trong file .env", "question": "Phạt?"}
+
+
+def test_import_history_from_browser(ctx):
+    client, _, cid = ctx
+    old = [
+        {"id": "abc", "role": "user", "text": "Phạt?"},
+        {"id": "def", "role": "assistant", "kind": "web", "coverage": "full", "text": "Theo [1]...", "question": "Phạt?",
+         "sources": [{"n": 1, "title": "Báo", "location": "a.vn", "excerpt": "...", "url": "https://a.vn", "added": True}],
+         "offer": None, "lạ": "bỏ qua"},
+    ]
+    conv = client.post(f"/api/collections/{cid}/conversations", json={"title": "Phạt?", "messages": old}).json()
+    assert conv["n_messages"] == 2
+    msgs = client.get(f"/api/conversations/{conv['id']}").json()["messages"]
+    assert msgs[0] == {"id": msgs[0]["id"], "role": "user", "text": "Phạt?"}
+    assert "lạ" not in msgs[1] and "added" not in msgs[1]["sources"][0] and isinstance(msgs[1]["id"], int)
+    bad = client.post(f"/api/collections/{cid}/conversations", json={"messages": [{"role": "system", "text": "x"}]})
+    assert bad.status_code == 422
+
+
+def test_deleting_collection_deletes_its_conversations(ctx):
+    client, svc, cid = ctx
+    conv = new_conversation(client, cid)
+    client.delete(f"/api/collections/{cid}")
+    assert client.get(f"/api/conversations/{conv}").status_code == 404
+    assert svc.db.conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
 
 
 def test_delete_document(ctx):
@@ -168,7 +269,8 @@ def test_ask_blocked_when_reindex_needed(ctx):
     _upload_legal(client, cid)
     svc.db.set_embed_model(cid, "other:model")
     assert client.get("/api/collections").json()[0]["needs_reindex"] is True
-    assert client.post(f"/api/collections/{cid}/ask", json={"question": "q"}).status_code == 409
+    conv = new_conversation(client, cid)
+    assert client.post(f"/api/conversations/{conv}/ask", json={"question": "q"}).status_code == 409
     evs = events(client.post(f"/api/collections/{cid}/reindex"))
     assert evs[-1] == {"type": "done", "errors": []}
     assert client.get("/api/collections").json()[0]["needs_reindex"] is False

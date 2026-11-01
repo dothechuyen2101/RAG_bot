@@ -1,5 +1,6 @@
-"""SQLite: tài khoản, phiên đăng nhập, danh mục bộ tài liệu/tài liệu và chỉ mục từ khóa FTS5."""
+"""SQLite: tài khoản, phiên đăng nhập, danh mục bộ tài liệu/tài liệu, lịch sử hội thoại và chỉ mục từ khóa FTS5."""
 
+import json
 import re
 import sqlite3
 import threading
@@ -42,6 +43,22 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (collection_id, content_hash)
 );
+-- Lịch sử hỏi đáp. Cuộc trò chuyện thuộc một bộ tài liệu, nên cũng thuộc chủ của bộ đó.
+CREATE TABLE IF NOT EXISTS conversations (
+    id            INTEGER PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    title         TEXT NOT NULL,
+    created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS conversations_by_collection ON conversations (collection_id, updated_at);
+-- Mỗi tin nhắn lưu nguyên dạng JSON mà giao diện hiển thị (câu trả lời, nguồn, lời mời tìm web).
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    data            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages (conversation_id, id);
 -- remove_diacritics 0: giữ dấu, để "điều" không khớp nhầm với "điêu"/"dieu".
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text, chunk_id UNINDEXED, doc_id UNINDEXED, collection_id UNINDEXED,
@@ -72,6 +89,16 @@ class User:
     username: str
     is_admin: bool
     created_at: str
+
+
+@dataclass
+class Conversation:
+    id: int
+    collection_id: int
+    title: str
+    created_at: str
+    updated_at: str
+    n_messages: int = 0
 
 
 @dataclass
@@ -205,6 +232,70 @@ class Database:
             self.conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?", (doc_id,))
             self.conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
+    # --- conversations ---
+
+    def create_conversation(self, collection_id: int, title: str) -> Conversation:
+        with self.lock, self.conn:
+            cur = self.conn.execute("INSERT INTO conversations (collection_id, title) VALUES (?, ?)",
+                                    (collection_id, title))
+        return self.get_conversation(cur.lastrowid)
+
+    def list_conversations(self, collection_id: int) -> list[Conversation]:
+        """Mới cập nhật trước."""
+        with self.lock:
+            rows = self.conn.execute(
+                f"{_CONVERSATION_QUERY} WHERE c.collection_id = ? GROUP BY c.id ORDER BY c.updated_at DESC, c.id DESC",
+                (collection_id,),
+            ).fetchall()
+        return [Conversation(**dict(r)) for r in rows]
+
+    def get_conversation(self, conversation_id: int) -> Conversation | None:
+        with self.lock:
+            row = self.conn.execute(f"{_CONVERSATION_QUERY} WHERE c.id = ? GROUP BY c.id",
+                                    (conversation_id,)).fetchone()
+        return Conversation(**dict(row)) if row else None
+
+    def delete_conversation(self, conversation_id: int) -> None:
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+    def add_message(self, conversation_id: int, message: dict) -> dict:
+        """Lưu tin nhắn, trả về tin nhắn kèm id."""
+        with self.lock, self.conn:
+            cur = self.conn.execute("INSERT INTO messages (conversation_id, data) VALUES (?, ?)",
+                                    (conversation_id, json.dumps(message, ensure_ascii=False)))
+            self.conn.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                              (conversation_id,))
+        return {"id": cur.lastrowid, **message}
+
+    def list_messages(self, conversation_id: int) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute("SELECT id, data FROM messages WHERE conversation_id = ? ORDER BY id",
+                                     (conversation_id,)).fetchall()
+        return [{"id": r["id"], **json.loads(r["data"])} for r in rows]
+
+    def get_message(self, conversation_id: int, message_id: int) -> dict | None:
+        with self.lock:
+            row = self.conn.execute("SELECT id, data FROM messages WHERE id = ? AND conversation_id = ?",
+                                    (message_id, conversation_id)).fetchone()
+        return {"id": row["id"], **json.loads(row["data"])} if row else None
+
+    def set_offer_state(self, conversation_id: int, state: str, message_id: int | None = None,
+                        query: str | None = None) -> None:
+        """Đổi trạng thái lời mời tìm web của một tin nhắn, hoặc mọi lời mời còn mở (message_id None)."""
+        if message_id is None:
+            target, params = "json_extract(data, '$.offer.state') = 'open'", ()
+        else:
+            target, params = "id = ?", (message_id,)
+        with self.lock, self.conn:
+            self.conn.execute(
+                f"""UPDATE messages
+                    SET data = json_set(data, '$.offer.state', ?,
+                                        '$.offer.query', coalesce(?, json_extract(data, '$.offer.query')))
+                    WHERE conversation_id = ? AND json_type(data, '$.offer') = 'object' AND {target}""",
+                (state, query, conversation_id, *params),
+            )
+
     # --- users & sessions ---
 
     def count_users(self) -> int:
@@ -291,6 +382,11 @@ class Database:
                 (match, collection_id, limit),
             ).fetchall()
         return [r["chunk_id"] for r in rows]
+
+
+_CONVERSATION_QUERY = """
+    SELECT c.id, c.collection_id, c.title, c.created_at, c.updated_at, COUNT(m.id) AS n_messages
+    FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id"""
 
 
 def _user(row) -> User | None:

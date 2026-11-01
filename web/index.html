@@ -144,10 +144,19 @@
           <p id="collection-sub"></p>
         </div>
         <div class="topbar-actions">
-          <button class="btn ghost small" id="clear-chat-btn" hidden>
-            <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>
+          <button class="btn ghost small" id="history-btn" aria-haspopup="true" aria-expanded="false" aria-controls="history-panel" title="Các cuộc trò chuyện đã lưu" hidden>
+            <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l3 2" /></svg>
+            <span>Lịch sử</span>
+            <b class="count" id="history-count"></b>
+          </button>
+          <button class="btn ghost small" id="new-chat-btn" title="Bắt đầu cuộc trò chuyện mới (cuộc hiện tại vẫn được lưu)" hidden>
+            <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /><path d="M12 9v6M9 12h6" /></svg>
             <span>Hội thoại mới</span>
           </button>
+          <div class="history-panel" id="history-panel" role="dialog" aria-label="Lịch sử trò chuyện" hidden>
+            <div class="history-head"><b>Lịch sử trò chuyện</b><small id="history-sub"></small></div>
+            <ul class="history-list" id="history-list"></ul>
+          </div>
           <button class="icon-btn danger-hover" id="delete-collection-btn" title="Xóa bộ tài liệu này" aria-label="Xóa bộ tài liệu này" hidden>
             <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" /></svg>
           </button>
