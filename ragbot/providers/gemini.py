@@ -4,7 +4,16 @@ import math
 from google import genai
 from google.genai import types
 
-from .base import CHAT_TIMEOUT_S, OCR_TIMEOUT_S, REQUEST_TIMEOUT_S, EmbedKind, api_retry, batched, call_with_fallback
+from .base import (
+    CHAT_TIMEOUT_S,
+    OCR_TIMEOUT_S,
+    REQUEST_TIMEOUT_S,
+    EmbedKind,
+    TextFn,
+    api_retry,
+    batched,
+    call_with_fallback,
+)
 
 QUOTA_MESSAGE = (
     "Gemini đã hết hạn mức trong ngày cho {models} (gói miễn phí chỉ có khoảng 20 lượt/ngày mỗi model). "
@@ -34,23 +43,30 @@ class GeminiLLM:
         )
 
     @api_retry
-    def _generate(self, contents, config: types.GenerateContentConfig) -> types.GenerateContentResponse:
-        return call_with_fallback(
-            self.models,
-            lambda model: self.client.models.generate_content(model=model, contents=contents, config=config),
-            QUOTA_MESSAGE,
-        )
+    def _generate(self, contents, config: types.GenerateContentConfig, on_text: TextFn | None = None) -> str:
+        def call(model: str) -> str:
+            if on_text is None:
+                return self.client.models.generate_content(model=model, contents=contents, config=config).text or ""
+            on_text("")
+            text = ""
+            for chunk in self.client.models.generate_content_stream(model=model, contents=contents, config=config):
+                if chunk.text:
+                    text += chunk.text
+                    on_text(text)
+            return text
 
-    def complete(self, system: str, user: str) -> str:
-        return self._generate(user, self._config(system)).text or ""
+        return call_with_fallback(self.models, call, QUOTA_MESSAGE)
 
-    def complete_json(self, system: str, user: str, schema: dict) -> dict:
+    def complete(self, system: str, user: str, on_text: TextFn | None = None) -> str:
+        return self._generate(user, self._config(system), on_text)
+
+    def complete_json(self, system: str, user: str, schema: dict, on_text: TextFn | None = None) -> dict:
         config = self._config(system, response_mime_type="application/json", response_json_schema=schema)
-        return json.loads(self._generate(user, config).text)
+        return json.loads(self._generate(user, config, on_text))
 
     def ocr(self, png: bytes, instruction: str) -> str:
         contents = [types.Part.from_bytes(data=png, mime_type="image/png"), instruction]
-        return self._generate(contents, self._config(timeout_s=OCR_TIMEOUT_S)).text or ""
+        return self._generate(contents, self._config(timeout_s=OCR_TIMEOUT_S))
 
 
 class GeminiEmbedder:

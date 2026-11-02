@@ -1,0 +1,7 @@
+# Bộ câu hỏi kiểm tra mẫu: thay bằng câu hỏi thật của bạn (nên có 20-30 câu).
+# Mỗi dòng một câu hỏi kèm đoạn đúng: "article" là số Điều, "doc" là một phần tên tài liệu hoặc số hiệu,
+# "contains" (tùy chọn) là cụm từ đoạn đúng phải chứa. Dòng bắt đầu bằng # được bỏ qua.
+# Chạy: .venv/bin/python server.py eval evals/mau.jsonl --collection "Pháp luật giao thông"
+{"question": "Không đội mũ bảo hiểm khi đi xe máy bị phạt bao nhiêu?", "article": "Điều 6", "doc": "100/2019"}
+{"question": "Uống rượu bia rồi lái ô tô bị phạt thế nào?", "article": "Điều 5", "doc": "100/2019", "contains": "nồng độ cồn"}
+{"question": "Điều 12 Nghị định 100/2019 quy định gì?", "article": "Điều 12", "doc": "100/2019"}

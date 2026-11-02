@@ -1,4 +1,5 @@
 import hashlib
+import json
 import math
 import re
 import sys
@@ -57,6 +58,25 @@ class FakeEmbedder:
         return out
 
 
+def scanned_pdf(n_scans: int) -> bytes:
+    """PDF có 1 trang chữ thật và n_scans trang chỉ là ảnh (giả lập bản scan)."""
+    import pymupdf
+
+    src = pymupdf.open()
+    page = src.new_page()
+    page.insert_text((72, 72), "Article 1. This page has a real text layer with more than fifty characters.", fontsize=9)
+    png = page.get_pixmap(dpi=50).tobytes("png")
+    for _ in range(n_scans):
+        src.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=png)
+    return src.tobytes()
+
+
+def _stream(text, on_text, step=7):
+    """Giả lập model stream: gọi on_text với toàn bộ chữ đã sinh, mỗi lần thêm vài ký tự."""
+    for end in range(step, len(text) + step, step):
+        on_text(text[:end])
+
+
 class FakeLLM:
     name = "fake:llm"
 
@@ -68,12 +88,16 @@ class FakeLLM:
         self.complete_calls = []
         self.ocr_calls = 0
 
-    def complete(self, system, user):
+    def complete(self, system, user, on_text=None):
         self.complete_calls.append(user)
+        if on_text:
+            _stream(self.text, on_text)
         return self.text
 
-    def complete_json(self, system, user, schema):
+    def complete_json(self, system, user, schema, on_text=None):
         self.json_calls.append(user)
+        if on_text:
+            _stream(json.dumps(self.json_result, ensure_ascii=False), on_text)
         return self.json_result
 
     def ocr(self, png, instruction):

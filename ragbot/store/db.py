@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SCHEMA = """
@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS documents (
     n_ocr_pages   INTEGER,
     n_chunks      INTEGER,
     created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- Hiệu lực văn bản (xem ingest/legal.py). so_hieu NULL: chưa đọc (tài liệu nạp từ phiên bản cũ).
+    so_hieu        TEXT,
+    issued_date    TEXT NOT NULL DEFAULT '',
+    effective_date TEXT NOT NULL DEFAULT '',
+    replaces       TEXT NOT NULL DEFAULT '[]',
+    amends         TEXT NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT '',  -- trạng thái người dùng tự chọn; '' = tự nhận diện
+    status_note    TEXT NOT NULL DEFAULT '',
     UNIQUE (collection_id, content_hash)
 );
 -- Lịch sử hỏi đáp. Cuộc trò chuyện thuộc một bộ tài liệu, nên cũng thuộc chủ của bộ đó.
@@ -113,6 +121,24 @@ class Document:
     n_ocr_pages: int | None
     n_chunks: int | None
     created_at: str
+    so_hieu: str | None = None
+    issued_date: str = ""
+    effective_date: str = ""
+    replaces: list[str] = field(default_factory=list)
+    amends: list[str] = field(default_factory=list)
+    status: str = ""
+    status_note: str = ""
+
+
+LEGAL_COLUMNS = {
+    "so_hieu": "TEXT",
+    "issued_date": "TEXT NOT NULL DEFAULT ''",
+    "effective_date": "TEXT NOT NULL DEFAULT ''",
+    "replaces": "TEXT NOT NULL DEFAULT '[]'",
+    "amends": "TEXT NOT NULL DEFAULT '[]'",
+    "status": "TEXT NOT NULL DEFAULT ''",
+    "status_note": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 class Database:
@@ -122,9 +148,20 @@ class Database:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._migrate_collections_owner()
+        self._migrate_documents_legal()
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self.lock = threading.RLock()
+
+    def _migrate_documents_legal(self) -> None:
+        """DB tạo trước khi có tính năng hiệu lực văn bản: thêm các cột còn thiếu vào bảng documents."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(documents)")}
+        if not cols:
+            return
+        with self.conn:
+            for name, decl in LEGAL_COLUMNS.items():
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
 
     def _migrate_collections_owner(self) -> None:
         """DB tạo trước khi có đăng nhập: bảng collections chưa có owner_id và tên đang UNIQUE toàn cục."""
@@ -194,12 +231,31 @@ class Database:
         with self.lock, self.conn:
             self.conn.execute(
                 """INSERT INTO documents (id, collection_id, title, source, source_type, content_hash,
-                                          n_pages, n_ocr_pages, n_chunks)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                          n_pages, n_ocr_pages, n_chunks, so_hieu, issued_date, effective_date,
+                                          replaces, amends)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (doc.id, doc.collection_id, doc.title, doc.source, doc.source_type, doc.content_hash,
-                 doc.n_pages, doc.n_ocr_pages, doc.n_chunks),
+                 doc.n_pages, doc.n_ocr_pages, doc.n_chunks, doc.so_hieu, doc.issued_date, doc.effective_date,
+                 json.dumps(doc.replaces), json.dumps(doc.amends)),
             )
             self._insert_fts(doc.collection_id, doc.id, chunks)
+
+    def update_document(self, doc_id: str, **fields) -> None:
+        """Sửa thông tin hiệu lực (các cột trong LEGAL_COLUMNS)."""
+        unknown = set(fields) - set(LEGAL_COLUMNS)
+        if unknown:
+            raise ValueError(f"Không sửa được cột {unknown}")
+        if not fields:
+            return
+        values = [json.dumps(v) if isinstance(v, list) else v for v in fields.values()]
+        with self.lock, self.conn:
+            self.conn.execute(f"UPDATE documents SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                              (*values, doc_id))
+
+    def get_document(self, doc_id: str) -> Document | None:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        return _document(row) if row else None
 
     def replace_chunks(self, collection_id: int, doc_id: str, chunks: list[tuple[str, str]]) -> None:
         with self.lock, self.conn:
@@ -218,14 +274,14 @@ class Database:
             rows = self.conn.execute(
                 "SELECT * FROM documents WHERE collection_id = ? ORDER BY created_at DESC, title", (collection_id,)
             ).fetchall()
-        return [Document(**dict(r)) for r in rows]
+        return [_document(r) for r in rows]
 
     def find_by_hash(self, collection_id: int, content_hash: str) -> Document | None:
         with self.lock:
             row = self.conn.execute(
                 "SELECT * FROM documents WHERE collection_id = ? AND content_hash = ?", (collection_id, content_hash)
             ).fetchone()
-        return Document(**dict(row)) if row else None
+        return _document(row) if row else None
 
     def delete_document(self, doc_id: str) -> None:
         with self.lock, self.conn:
@@ -387,6 +443,13 @@ class Database:
 _CONVERSATION_QUERY = """
     SELECT c.id, c.collection_id, c.title, c.created_at, c.updated_at, COUNT(m.id) AS n_messages
     FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id"""
+
+
+def _document(row) -> Document:
+    data = dict(row)
+    data["replaces"] = json.loads(data.get("replaces") or "[]")
+    data["amends"] = json.loads(data.get("amends") or "[]")
+    return Document(**data)
 
 
 def _user(row) -> User | None:

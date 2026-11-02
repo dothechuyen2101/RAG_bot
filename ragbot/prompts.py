@@ -28,6 +28,9 @@ Quy tắc bắt buộc:
    chỉ khác chi tiết), hãy nêu thông tin đó, nói rõ điểm khác so với câu hỏi, và đặt coverage là "partial"
    thay vì "none".
 6. Trả lời bằng ngôn ngữ của câu hỏi, rõ ràng, dùng gạch đầu dòng khi liệt kê.
+7. Một số đoạn có ghi chú hiệu lực trong phần Nguồn (HẾT HIỆU LỰC, ĐÃ ĐƯỢC SỬA ĐỔI, SẮP HẾT HIỆU LỰC,
+   CHƯA CÓ HIỆU LỰC). Ưu tiên văn bản còn hiệu lực. Khi dùng thông tin từ đoạn có ghi chú, phải nói rõ tình trạng
+   đó và nêu văn bản thay thế hoặc sửa đổi nếu ghi chú có nhắc tới.
 
 Đánh giá mức độ tài liệu trả lời được câu hỏi (trường coverage):
 - "full": tài liệu trả lời đầy đủ câu hỏi.

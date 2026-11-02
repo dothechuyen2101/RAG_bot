@@ -1,6 +1,7 @@
+import pytest
 from conftest import LEGAL_TEXT, FakeLLM
 
-from ragbot.answer import answer_from_docs, answer_from_web
+from ragbot.answer import answer_from_docs, answer_from_web, partial_answer
 from ragbot.websearch import WebResult
 
 
@@ -76,3 +77,52 @@ def test_web_no_results():
     llm = FakeLLM()
     ans = answer_from_web(llm, EmptySearch(), "q", "Q?")
     assert "Không tìm thấy" in ans.text and llm.complete_calls == []
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (r'{"coverage": "full", "answer": "Phạt 6\n- 8 triệu [1', "Phạt 6\n- 8 triệu [1"),
+    (r'{"answer": "xong [1].", "citations": [1]}', "xong [1]."),
+    ('{"answer": "dở' + "\\", "dở"),  # escape bị cắt ở cuối
+    (r'{"answer": "Điều \"5\""', 'Điều "5"'),
+    (r'{"answer": "vui 😀!', "vui \U0001F600!"),
+    (r'{"answer": "vui \ud83d', "vui "),  # nửa cặp surrogate: chờ phần sau
+    (r'{"coverage": "no', ""),
+])
+def test_partial_answer_reads_streaming_json(raw, expected):
+    assert partial_answer(raw) == expected
+
+
+def test_answer_text_streams_while_generating(stack):
+    final = "Phạt từ 6.000.000 đồng đến 8.000.000 đồng [1]."
+    llm = FakeLLM({"coverage": "full", "answer": final, "citations": [1], "web_query": ""})
+    seen = []
+    ans = answer_from_docs(question="Phạt nồng độ cồn?", history=[], on_text=seen.append, **_ready(stack, llm))
+    assert len(seen) > 3 and seen[-1] == final == ans.text
+    assert all(final.startswith(s) for s in seen)
+
+
+def test_condense_uses_its_own_model(stack):
+    condense = FakeLLM(text="Mức phạt nồng độ cồn với xe máy là bao nhiêu?")
+    main = FakeLLM({"coverage": "full", "answer": "x [1]", "citations": [1], "web_query": ""})
+    history = [{"role": "user", "content": "Phạt nồng độ cồn ô tô?"}, {"role": "assistant", "content": "6-8 triệu [1]."}]
+    ans = answer_from_docs(question="còn xe máy?", history=history, condense_llm=condense, **_ready(stack, main))
+    assert ans.question == "Mức phạt nồng độ cồn với xe máy là bao nhiêu?"
+    assert len(condense.complete_calls) == 1 and main.complete_calls == [] and len(main.json_calls) == 1
+
+
+def test_sources_point_to_document(stack):
+    llm = FakeLLM({"coverage": "full", "answer": "Phạt [1].", "citations": [1], "web_query": ""})
+    ans = answer_from_docs(question="Phạt nồng độ cồn ô tô?", history=[], **_ready(stack, llm))
+    doc = stack["db"].list_documents(stack["cid"])[0]
+    assert ans.sources[0].doc_id == doc.id
+    assert ans.sources[0].status == ""  # văn bản không có gì cần lưu ý
+
+
+def test_web_answer_streams():
+    class FakeSearch:
+        def search(self, query):
+            return [WebResult("Cổng TTĐT", "https://chinhphu.vn/a", "Nội dung")]
+
+    seen = []
+    answer_from_web(FakeLLM(text="Theo nguồn [1], mức phạt là ..."), FakeSearch(), "q", "Q?", on_text=seen.append)
+    assert seen[-1] == "Theo nguồn [1], mức phạt là ..."

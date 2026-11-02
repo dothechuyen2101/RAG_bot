@@ -159,6 +159,8 @@ def test_collections_are_private_per_user(svc, admin):
         ("post", f"/api/collections/{mine}/urls", {"json": {"urls": ["https://a.vn"]}}),
         ("post", f"/api/collections/{mine}/reindex", {}),
         ("delete", f"/api/collections/{mine}/documents/{doc_id}", {}),
+        ("patch", f"/api/collections/{mine}/documents/{doc_id}", {"json": {"status": "expired"}}),
+        ("get", f"/api/documents/{doc_id}/file", {}),
         ("delete", f"/api/collections/{mine}", {}),
     ]:
         assert getattr(binh, method)(path, **kwargs).status_code == 404, path

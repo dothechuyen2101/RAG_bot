@@ -214,6 +214,30 @@
     </form>
   </dialog>
 
+  <dialog class="dialog" id="legal-dialog">
+    <form id="legal-form" novalidate>
+      <h2>Thông tin hiệu lực</h2>
+      <p id="legal-doc"></p>
+      <label class="field"><span>Số hiệu văn bản</span><input class="input" id="legal-so-hieu" maxlength="60" placeholder="Ví dụ: 100/2019/NĐ-CP" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Ngày có hiệu lực</span><input class="input" type="date" id="legal-effective"></label>
+      <label class="field"><span>Trạng thái</span>
+        <select class="input" id="legal-status">
+          <option value="">Tự nhận diện</option>
+          <option value="in_force">Còn hiệu lực</option>
+          <option value="amended">Đã được sửa đổi</option>
+          <option value="expired">Hết hiệu lực</option>
+        </select>
+      </label>
+      <label class="field" id="legal-note-field"><span>Ghi chú, ví dụ: bị thay thế bởi văn bản nào</span><input class="input" id="legal-note" maxlength="300" autocomplete="off"></label>
+      <p class="legal-auto" id="legal-auto"></p>
+      <div class="form-error" id="legal-error" role="alert" hidden></div>
+      <div class="dialog-actions">
+        <button class="btn ghost" type="button" data-close>Hủy</button>
+        <button class="btn primary" type="submit">Lưu</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog class="dialog wide" id="users-dialog">
     <div class="dialog-head">
       <div>

@@ -3,7 +3,21 @@ import json
 
 import openai
 
-from .base import CHAT_TIMEOUT_S, OCR_TIMEOUT_S, REQUEST_TIMEOUT_S, EmbedKind, api_retry, batched, call_with_fallback
+from .base import (
+    CHAT_TIMEOUT_S,
+    OCR_TIMEOUT_S,
+    REQUEST_TIMEOUT_S,
+    EmbedKind,
+    TextFn,
+    api_retry,
+    batched,
+    call_with_fallback,
+    describe_error,
+    log,
+)
+
+# Gateway không hỗ trợ stream (hoặc stream kèm JSON schema) thường trả các mã này: gọi lại không stream.
+NO_STREAM_STATUS = {400, 422, 501}
 
 
 class OpenAILLM:
@@ -14,25 +28,26 @@ class OpenAILLM:
         self.name = f"openai:{model}"
 
     @api_retry
-    def complete(self, system: str, user: str) -> str:
-        resp = self.client.responses.create(
-            model=self.model, instructions=system, input=user, reasoning=self.reasoning, store=False,
-            timeout=CHAT_TIMEOUT_S,
-        )
-        return resp.output_text
+    def _respond(self, on_text: TextFn | None, **kwargs) -> str:
+        kwargs = dict(model=self.model, reasoning=self.reasoning, store=False, timeout=CHAT_TIMEOUT_S, **kwargs)
+        if on_text is None:
+            return self.client.responses.create(**kwargs).output_text
+        on_text("")
+        text = ""
+        for event in self.client.responses.create(**kwargs, stream=True):
+            if event.type == "response.output_text.delta":
+                text += event.delta
+                on_text(text)
+        return text
 
-    @api_retry
-    def complete_json(self, system: str, user: str, schema: dict) -> dict:
-        resp = self.client.responses.create(
-            model=self.model,
-            instructions=system,
-            input=user,
-            reasoning=self.reasoning,
+    def complete(self, system: str, user: str, on_text: TextFn | None = None) -> str:
+        return self._respond(on_text, instructions=system, input=user)
+
+    def complete_json(self, system: str, user: str, schema: dict, on_text: TextFn | None = None) -> dict:
+        return json.loads(self._respond(
+            on_text, instructions=system, input=user,
             text={"format": {"type": "json_schema", "name": "result", "schema": schema, "strict": True}},
-            store=False,
-            timeout=CHAT_TIMEOUT_S,
-        )
-        return json.loads(resp.output_text)
+        ))
 
     @api_retry
     def ocr(self, png: bytes, instruction: str) -> str:
@@ -65,21 +80,45 @@ class ChatCompletionsLLM:
         self.provider = provider
         self.name = f"{provider}:{models[0]}"
 
+    def _chat(self, messages: list[dict], timeout: int, on_text: TextFn | None = None, **kwargs) -> str:
+        if on_text is None:
+            return self._chat_models(messages, timeout, None, **kwargs)
+        try:
+            return self._chat_models(messages, timeout, on_text, **kwargs)
+        except openai.APIStatusError as e:
+            if e.status_code not in NO_STREAM_STATUS:
+                raise
+            log.warning("%s không stream được (%s), gọi lại không stream", self.provider, describe_error(e))
+            on_text("")
+            return self._chat_models(messages, timeout, None, **kwargs)
+
     @api_retry
-    def _chat(self, messages: list[dict], timeout: int, **kwargs) -> str:
+    def _chat_models(self, messages: list[dict], timeout: int, on_text: TextFn | None, **kwargs) -> str:
         def call(model: str) -> str:
-            resp = self.client.chat.completions.create(model=model, messages=messages, timeout=timeout, **kwargs)
-            return resp.choices[0].message.content or ""
+            if on_text is None:
+                resp = self.client.chat.completions.create(model=model, messages=messages, timeout=timeout, **kwargs)
+                return resp.choices[0].message.content or ""
+            on_text("")
+            text = ""
+            # timeout áp cho từng lần chờ dữ liệu, nên câu trả lời dài vẫn chạy hết miễn là model không ngừng giữa chừng.
+            for chunk in self.client.chat.completions.create(model=model, messages=messages, timeout=timeout,
+                                                             stream=True, **kwargs):
+                if chunk.choices and (delta := chunk.choices[0].delta.content):
+                    text += delta
+                    on_text(text)
+            return text
 
         return call_with_fallback(self.models, call, f"{self.provider} đã hết hạn mức cho {{models}}.")
 
-    def complete(self, system: str, user: str) -> str:
-        return self._chat([{"role": "system", "content": system}, {"role": "user", "content": user}], CHAT_TIMEOUT_S)
+    def complete(self, system: str, user: str, on_text: TextFn | None = None) -> str:
+        return self._chat([{"role": "system", "content": system}, {"role": "user", "content": user}], CHAT_TIMEOUT_S,
+                          on_text)
 
-    def complete_json(self, system: str, user: str, schema: dict) -> dict:
+    def complete_json(self, system: str, user: str, schema: dict, on_text: TextFn | None = None) -> dict:
         text = self._chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             CHAT_TIMEOUT_S,
+            on_text,
             response_format={"type": "json_schema", "json_schema": {"name": "result", "schema": schema, "strict": True}},
         )
         return parse_json(text)

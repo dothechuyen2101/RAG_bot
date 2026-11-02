@@ -34,25 +34,35 @@ class Settings(BaseSettings):
     openai_reasoning_effort: Literal["none", "low", "medium", "high"] = "low"
     openai_embed_model: str = "text-embedding-3-small"
 
+    # Model riêng cho từng việc, cùng provider LLM_PROVIDER; để trống thì dùng model chat.
+    # Model dự phòng (*_FALLBACK_MODELS) vẫn dùng chung khi model này treo hoặc quá tải.
+    condense_model: str = ""  # viết lại câu hỏi nối tiếp: việc đơn giản, nên dùng model nhanh
+    ocr_model: str = ""
+
     tavily_api_key: str = ""
     tavily_max_results: int = 5
 
     top_k: int = 8
     min_similarity: float = 0.0
     ocr_workers: int = 4
+    # PDF cần OCR nhiều trang hơn mức này thì hỏi người dùng trước (mỗi trang 1 lượt gọi model). 0 = không hỏi.
+    ocr_confirm_pages: int = 20
+    max_upload_mb: float = 50
+    # Cho nạp link tới địa chỉ nội bộ (localhost, 192.168.x.x...). Chỉ bật khi mọi tài khoản đều đáng tin.
+    allow_private_urls: bool = False
 
     data_dir: Path = ROOT / "data"
 
     @property
     def gemini_models(self) -> list[str]:
-        return _with_fallbacks(self.gemini_chat_model, self.gemini_fallback_models)
+        return with_fallbacks(self.gemini_chat_model, self.gemini_fallback_models)
 
     @property
     def wellflow_models(self) -> list[str]:
-        return _with_fallbacks(self.wellflow_chat_model, self.wellflow_fallback_models)
+        return with_fallbacks(self.wellflow_chat_model, self.wellflow_fallback_models)
 
 
-def _with_fallbacks(primary: str, fallbacks: str) -> list[str]:
+def with_fallbacks(primary: str, fallbacks: str) -> list[str]:
     """Model chính rồi tới các model dự phòng (chuỗi cách nhau bởi dấu phẩy), bỏ trùng."""
     return list(dict.fromkeys([primary, *(m.strip() for m in fallbacks.split(",") if m.strip())]))
 

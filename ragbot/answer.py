@@ -16,6 +16,10 @@ EXCERPT_CHARS = 2400
 WEB_CONTENT_CHARS = 3000
 
 ProgressFn = Callable[[str], None]
+TextFn = Callable[[str], None]
+
+_ANSWER_KEY = re.compile(r'"answer"\s*:\s*"')
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 
 
 def _noop(_: str) -> None:
@@ -28,7 +32,12 @@ class Source:
     title: str
     location: str  # "Trang 3 · Điều 5" hoặc tên miền
     excerpt: str
-    url: str = ""
+    url: str = ""  # trang web (câu trả lời từ internet)
+    doc_id: str = ""  # tài liệu trong bộ: mở file gốc qua /api/documents/{doc_id}/file
+    page: int = 0
+    status: str = ""  # hiệu lực văn bản cần lưu ý: pending | expiring | amended | expired
+    status_label: str = ""
+    status_note: str = ""
 
 
 @dataclass
@@ -71,11 +80,19 @@ def location_of(meta: dict) -> str:
     return " · ".join(parts)
 
 
+def _legal_warning(meta: dict) -> str:
+    """Ghi chú hiệu lực cần lưu ý khi trích đoạn này, ví dụ "HẾT HIỆU LỰC: Bị thay thế bởi ..."."""
+    if meta.get("legal_status") not in ("pending", "expiring", "amended", "expired"):
+        return ""
+    note = meta.get("legal_note", "")
+    return f"{meta['legal_label'].upper()}{': ' + note if note else ''}"
+
+
 def format_context(hits: list[Hit]) -> str:
     blocks = []
     for n, h in enumerate(hits, 1):
-        loc = location_of(h.meta)
-        blocks.append(f"[{n}] (Nguồn: {h.meta.get('title', '')}{' | ' + loc if loc else ''})\n{h.text}")
+        parts = [h.meta.get("title", ""), location_of(h.meta), _legal_warning(h.meta)]
+        blocks.append(f"[{n}] (Nguồn: {' | '.join(p for p in parts if p)})\n{h.text}")
     return "\n\n".join(blocks)
 
 
@@ -83,6 +100,53 @@ def _cited_numbers(result_citations: list, text: str, n_max: int) -> list[int]:
     found = {int(n) for n in result_citations if isinstance(n, int)}
     found |= {int(n) for n in re.findall(r"\[(\d+)\]", text)}
     return sorted(n for n in found if 1 <= n <= n_max)
+
+
+def partial_answer(raw: str) -> str:
+    """Phần trường "answer" đã nhận được trong chuỗi JSON đang stream (có thể chưa đóng ngoặc)."""
+    m = _ANSWER_KEY.search(raw)
+    if not m:
+        return ""
+    out: list[str] = []
+    i = m.end()
+    while i < len(raw):
+        c = raw[i]
+        if c == '"':
+            break
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        if i + 1 >= len(raw):
+            break  # ký tự escape bị cắt ở cuối, chờ phần sau
+        if raw[i + 1] != "u":
+            out.append(_ESCAPES.get(raw[i + 1], raw[i + 1]))
+            i += 2
+            continue
+        try:
+            code = int(raw[i + 2 : i + 6], 16) if len(raw) >= i + 6 else None
+            if code is not None and 0xD800 <= code < 0xDC00:  # cặp surrogate (emoji...)
+                low = int(raw[i + 8 : i + 12], 16) if raw[i + 6 : i + 8] == "\\u" and len(raw) >= i + 12 else None
+                code = None if low is None else 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                i += 6
+        except ValueError:
+            code = None
+        if code is None:
+            break
+        out.append(chr(code))
+        i += 6
+    return "".join(out)
+
+
+def _source(n: int, hit: Hit) -> Source:
+    meta = hit.meta
+    warn = bool(_legal_warning(meta))
+    return Source(
+        n, meta.get("title", ""), location_of(meta), _excerpt(hit.text),
+        doc_id=meta.get("doc_id", ""), page=meta.get("page_start") or 0,
+        status=meta.get("legal_status", "") if warn else "", status_label=meta.get("legal_label", "") if warn else "",
+        status_note=meta.get("legal_note", "") if warn else "",
+    )
 
 
 def answer_from_docs(
@@ -94,15 +158,20 @@ def answer_from_docs(
     top_k: int,
     min_similarity: float = 0.0,
     progress: ProgressFn = _noop,
+    condense_llm: LLM | None = None,
+    on_text: TextFn | None = None,
 ) -> Answer:
+    """condense_llm: model viết lại câu hỏi nối tiếp (mặc định là llm).
+    on_text: nhận phần câu trả lời đã sinh được, để hiện dần trên giao diện."""
     if history:
         progress("Đang hiểu câu hỏi trong ngữ cảnh hội thoại...")
-    standalone = condense_question(llm, history, question)
+    standalone = condense_question(condense_llm or llm, history, question)
     progress("Đang tìm trong tài liệu...")
     hits = retriever.search(collection_id, standalone, top_k)
 
     best = max((h.similarity for h in hits if h.similarity is not None), default=0.0)
-    if not hits or (min_similarity > 0 and best < min_similarity):
+    pinned = any(h.pinned for h in hits)
+    if not hits or (min_similarity > 0 and best < min_similarity and not pinned):
         return Answer(kind="docs", coverage="none", text="", question=standalone, web_query=standalone)
 
     progress(f"Đang đọc {len(hits)} đoạn liên quan và soạn câu trả lời...")
@@ -110,6 +179,7 @@ def answer_from_docs(
         prompts.DOCS_SYSTEM,
         prompts.DOCS_USER.format(context=format_context(hits), question=standalone),
         prompts.DOCS_SCHEMA,
+        on_text=(lambda raw: on_text(partial_answer(raw))) if on_text else None,
     )
     coverage: Coverage = result.get("coverage") if result.get("coverage") in ("full", "partial", "none") else "none"
     text = (result.get("answer") or "").strip()
@@ -118,10 +188,8 @@ def answer_from_docs(
     if coverage == "none":
         text = ""
 
-    sources = [
-        Source(n, hits[n - 1].meta.get("title", ""), location_of(hits[n - 1].meta), _excerpt(hits[n - 1].text))
-        for n in _cited_numbers(result.get("citations") or [], text, len(hits))
-    ] if text else []
+    sources = [_source(n, hits[n - 1]) for n in _cited_numbers(result.get("citations") or [], text, len(hits))
+               ] if text else []
     return Answer(
         kind="docs",
         coverage=coverage,
@@ -132,7 +200,8 @@ def answer_from_docs(
     )
 
 
-def answer_from_web(llm: LLM, search: TavilySearch, query: str, question: str, progress: ProgressFn = _noop) -> Answer:
+def answer_from_web(llm: LLM, search: TavilySearch, query: str, question: str, progress: ProgressFn = _noop,
+                    on_text: TextFn | None = None) -> Answer:
     progress("Đang tìm trên internet...")
     results = search.search(query)
     if not results:
@@ -142,7 +211,8 @@ def answer_from_web(llm: LLM, search: TavilySearch, query: str, question: str, p
     context = "\n\n".join(
         f"[{n}] {r.title}\nURL: {r.url}\n{r.content[:WEB_CONTENT_CHARS]}" for n, r in enumerate(results, 1)
     )
-    text = llm.complete(prompts.WEB_SYSTEM, prompts.WEB_USER.format(context=context, question=question)).strip()
+    text = llm.complete(prompts.WEB_SYSTEM, prompts.WEB_USER.format(context=context, question=question),
+                        on_text=on_text).strip()
     sources = [
         Source(n, r.title, urlparse(r.url).netloc, _excerpt(r.content), url=r.url) for n, r in enumerate(results, 1)
     ]

@@ -14,6 +14,9 @@ from tenacity import (
 )
 
 EmbedKind = Literal["document", "query"]
+# Nhận TOÀN BỘ chữ đã sinh tới lúc đó (không phải phần mới). Khi chuyển sang model dự phòng
+# hoặc thử lại, được gọi với chuỗi rỗng để giao diện xóa phần đã hiện.
+TextFn = Callable[[str], None]
 
 TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
 # Model khỏe trả lời chat trong vài giây, OCR một trang trong khoảng 10 giây.
@@ -28,9 +31,10 @@ log = logging.getLogger("ragbot.providers")
 class LLM(Protocol):
     name: str
 
-    def complete(self, system: str, user: str) -> str: ...
+    # on_text: nhận chữ dần dần trong lúc model đang sinh (stream).
+    def complete(self, system: str, user: str, on_text: TextFn | None = None) -> str: ...
 
-    def complete_json(self, system: str, user: str, schema: dict) -> dict: ...
+    def complete_json(self, system: str, user: str, schema: dict, on_text: TextFn | None = None) -> dict: ...
 
     def ocr(self, png: bytes, instruction: str) -> str: ...
 

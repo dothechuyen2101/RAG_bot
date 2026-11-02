@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from conftest import LEGAL_TEXT, FakeEmbedder, FakeLLM
+from conftest import LEGAL_TEXT, FakeEmbedder, FakeLLM, scanned_pdf
 from fastapi.testclient import TestClient
 
 from ragbot.api import create_app
@@ -12,7 +12,7 @@ from ragbot.ingest import Ingestor
 from ragbot.providers import MissingKeyError
 from ragbot.retrieval import Retriever
 from ragbot.services import Services
-from ragbot.store import Database, VectorStore
+from ragbot.store import Database, Document, VectorStore
 from ragbot.websearch import WebResult
 
 NOT_FOUND = {"coverage": "none", "answer": "", "citations": [], "web_query": "mức phạt xe máy"}
@@ -60,7 +60,8 @@ def test_serves_web_ui(ctx):
 
 def test_info(ctx):
     client, _, _ = ctx
-    assert client.get("/api/info").json() == {"llm": "fake:llm", "embedder": "fake:bow:64", "web_search": True}
+    assert client.get("/api/info").json() == {"llm": "fake:llm", "condense_llm": "fake:llm", "ocr_llm": "fake:llm",
+                                              "embedder": "fake:bow:64", "web_search": True}
 
 
 def test_collection_crud(ctx):
@@ -95,7 +96,7 @@ def test_upload_streams_progress_then_lists_document(ctx):
 def test_add_urls_reports_per_item_errors(ctx, monkeypatch):
     client, svc, cid = ctx
 
-    def fake_ingest_url(cid_, url, progress):
+    def fake_ingest_url(cid_, url, progress, confirm_ocr=False):
         progress("OCR 1/2 trang")
         raise RuntimeError("trang chặn bot")
 
@@ -282,3 +283,86 @@ def test_missing_key_reported_by_api():
 
     resp = TestClient(create_app(factory)).get("/api/info")
     assert resp.status_code == 503 and "GEMINI_API_KEY" in resp.json()["detail"]
+
+
+FULL = {"coverage": "full", "answer": "Phạt từ 6 đến 8 triệu đồng [1].", "citations": [1], "web_query": ""}
+
+
+def test_ask_streams_answer_text(ctx):
+    client, svc, cid = ctx
+    _upload_legal(client, cid)
+    svc.llm.json_result = FULL
+    evs = ask(client, new_conversation(client, cid), "Phạt nồng độ cồn ô tô?")
+    deltas = [e for e in evs if e["type"] == "delta"]
+    assert len(deltas) > 1 and "".join(e["text"] for e in deltas) == FULL["answer"]
+    msg = evs[-1]["message"]
+    assert msg["text"] == FULL["answer"] and msg["sources"][0]["doc_id"]
+
+
+def test_web_answer_streams(ctx):
+    client, svc, cid = ctx
+    _upload_legal(client, cid)
+    conv = new_conversation(client, cid)
+    offer_id = ask(client, conv, "Phạt xe máy?")[-1]["message"]["id"]
+    evs = events(client.post(f"/api/conversations/{conv}/messages/{offer_id}/web", json={}))
+    assert "".join(e["text"] for e in evs if e["type"] == "delta") == "Theo [1], mức phạt là ..."
+
+
+def test_many_scanned_pages_ask_before_ocr(ctx):
+    client, svc, cid = ctx
+    svc.ingestor.ocr_confirm_pages = 2
+    pdf = scanned_pdf(3)
+
+    def upload(query=""):
+        files = [("files", ("scan.pdf", pdf, "application/pdf"))]
+        return events(client.post(f"/api/collections/{cid}/files{query}", files=files))
+
+    evs = upload()
+    confirm = next(e for e in evs if e["type"] == "item_confirm")
+    assert (confirm["item"], confirm["ocr_pages"], confirm["total_pages"]) == ("scan.pdf", 3, 4)
+    assert evs[-1] == {"type": "done", "ok": 0, "total": 1} and svc.llm.ocr_calls == 0
+    assert client.get(f"/api/collections/{cid}/documents").json() == []
+    assert upload("?confirm_ocr=true")[-1]["ok"] == 1 and svc.llm.ocr_calls == 3
+
+
+def test_upload_too_large_rejected(ctx):
+    client, svc, cid = ctx
+    svc.ingestor.max_bytes = 100
+    evs = _upload_legal(client, cid)
+    assert evs[-2]["type"] == "item_error" and "lớn hơn giới hạn" in evs[-2]["message"]
+    assert client.get(f"/api/collections/{cid}/documents").json() == []
+
+
+def test_document_legal_info_and_manual_status(ctx):
+    client, svc, cid = ctx
+    doc_id = _upload_legal(client, cid)[-2]["document"]["id"]
+    doc = client.get(f"/api/collections/{cid}/documents").json()[0]
+    assert doc["so_hieu"] == "100/2019/NĐ-CP" and doc["legal"]["code"] == ""
+
+    url = f"/api/collections/{cid}/documents/{doc_id}"
+    resp = client.patch(url, json={"status": "expired", "status_note": " Đã có văn bản mới "})
+    assert resp.status_code == 200
+    assert resp.json()["legal"] == {"code": "expired", "note": "Đã có văn bản mới", "manual": True,
+                                    "label": "Hết hiệu lực"}
+    assert client.patch(url, json={"effective_date": "2020-01-01"}).json()["effective_date"] == "2020-01-01"
+    assert client.patch(url, json={"effective_date": "1/1/2020"}).status_code == 400
+    assert client.patch(url, json={"status": "bừa"}).status_code == 422
+    assert client.patch(url, json={"status": ""}).json()["legal"]["code"] == ""
+    assert client.patch(f"/api/collections/{cid}/documents/{'0' * 32}", json={}).status_code == 404
+
+
+def test_open_original_file(ctx):
+    client, svc, cid = ctx
+    doc_id = _upload_legal(client, cid)[-2]["document"]["id"]
+    resp = client.get(f"/api/documents/{doc_id}/file")
+    assert resp.status_code == 200 and resp.content == LEGAL_TEXT.encode()
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.headers["content-disposition"].startswith("inline")
+    assert client.get("/api/documents/*/file").status_code == 404
+    assert client.get(f"/api/documents/{'0' * 32}/file").status_code == 404
+
+    # Trang web chỉ lưu chữ đã trích: chuyển sang trang gốc.
+    web_doc = Document("ab" * 16, cid, "Trang web", "https://a.vn/x", "url", "h", None, 0, 0, "")
+    svc.db.add_document(web_doc, [])
+    resp = client.get(f"/api/documents/{web_doc.id}/file", follow_redirects=False)
+    assert resp.status_code == 307 and resp.headers["location"] == "https://a.vn/x"

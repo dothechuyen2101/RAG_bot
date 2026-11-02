@@ -153,6 +153,7 @@ kbd {
 .btn.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
 .btn.danger { background: var(--danger); color: #fff; }
 .btn.danger:hover { box-shadow: 0 8px 20px -8px var(--danger); transform: translateY(-1px); }
+a.btn { text-decoration: none; }
 
 .btn .spinner {
   position: absolute; width: 18px; height: 18px; border-radius: 50%;
@@ -173,6 +174,7 @@ kbd {
   transition: border-color 0.2s, box-shadow 0.2s, background-color 0.2s;
 }
 .input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); background: var(--surface); }
+select.input { cursor: pointer; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; font-size: 13px; font-weight: 600; color: var(--text-2); }
 .form-error {
   margin: 0 0 12px; padding: 10px 12px;
@@ -342,6 +344,18 @@ kbd {
 .doc-item.error { background: var(--danger-soft); }
 .doc-item.error .doc-meta { color: var(--danger); }
 .doc-item.done-flash { animation: doneFlash 1.1s var(--ease); }
+.doc-item.confirm { background: var(--warning-soft); }
+.doc-item.confirm .doc-meta { color: var(--warning); }
+.confirm-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+
+/* Hiệu lực văn bản */
+.legal-badge {
+  display: inline-block; margin-top: 4px; padding: 1px 7px;
+  border-radius: 999px; font-size: 11px; font-weight: 600;
+  background: var(--warning-soft); color: var(--warning);
+}
+.legal-badge.expired { background: var(--danger-soft); color: var(--danger); }
+.legal-badge.in_force { background: var(--success-soft); color: var(--success); }
 
 .progress { height: 4px; margin-top: 7px; border-radius: 99px; background: var(--surface-3); overflow: hidden; }
 .progress > span {
@@ -668,6 +682,12 @@ kbd {
 }
 .source-excerpt.expanded { -webkit-line-clamp: unset; }
 .source-actions { margin-top: 8px; }
+.source-status {
+  display: flex; align-items: flex-start; gap: 5px; margin-top: 5px;
+  font-size: 12px; font-weight: 600; line-height: 1.4; color: var(--warning);
+}
+.source-status svg { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.source-status.expired { color: var(--danger); }
 
 /* Lời mời tìm trên internet */
 .offer {
@@ -777,6 +797,7 @@ kbd {
 .dialog .field { margin-bottom: 12px; }
 .dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .dialog-head p { margin: 0; }
+.dialog p.legal-auto { margin: -2px 0 14px; font-size: 12.5px; color: var(--muted); }
 .user-add {
   display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 8px; align-items: center;
   margin-bottom: 12px; padding: 12px;

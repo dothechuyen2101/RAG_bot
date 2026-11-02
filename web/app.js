@@ -20,6 +20,8 @@ const ICONS = {
   retry: '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /></svg>',
   key: '<svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4" /><path d="m11 12 9-9M17 6l3 3M15 8l2 2" /></svg>',
   chat: '<svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>',
+  edit: '<svg viewBox="0 0 24 24"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>',
+  open: '<svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9" /><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>',
 };
 
 /** Tạo phần tử: el("div", {class: "x", text: "..."}, child1, child2). Không bao giờ nhận HTML từ dữ liệu. */
@@ -220,6 +222,7 @@ const state = {
   openConv: new Map(), // cid -> id cuộc trò chuyện đang mở; null: cuộc mới chưa hỏi gì; chưa có: đang tải
   chats: new Map(), // id cuộc trò chuyện -> danh sách tin nhắn
   thinking: new Map(), // id cuộc trò chuyện -> dòng trạng thái đang xử lý
+  streaming: new Map(), // id cuộc trò chuyện -> phần câu trả lời model đã viết được
   creating: new Set(), // cid đang tạo cuộc trò chuyện mới (chặn gửi trùng)
   flashDocs: new Set(),
 };
@@ -274,8 +277,12 @@ function renderInfo() {
   if (!info) return;
   const row = (on, label, value) =>
     el("div", {}, el("span", { class: `status-dot ${on ? "on" : ""}` }), `${label}: `, el("b", { text: value, title: value }));
+  const model = (name) => name.replace(":", " · ");
+  box.append(row(true, "Trả lời", model(info.llm)));
+  // Model riêng cho từng việc (CONDENSE_MODEL, OCR_MODEL) chỉ hiện khi khác model trả lời.
+  if (info.condense_llm && info.condense_llm !== info.llm) box.append(row(true, "Hiểu câu hỏi", model(info.condense_llm)));
+  if (info.ocr_llm && info.ocr_llm !== info.llm) box.append(row(true, "OCR", model(info.ocr_llm)));
   box.append(
-    row(true, "Trả lời", info.llm.replace(":", " · ")),
     row(true, "Embedding", info.embedder.split(":").slice(1, 2).join("") || info.embedder),
     row(info.web_search, "Tìm web", info.web_search ? "Tavily" : "chưa cấu hình"),
   );
@@ -378,8 +385,14 @@ function docBadge(type, label = "") {
   return kind === "url" ? el("span", { class: "doc-badge url", icon: "link" }) : el("span", { class: `doc-badge ${kind}`, text: BADGE[kind] || "TXT" });
 }
 
+function legalBadge(legal) {
+  if (!legal?.label) return null; // chưa rõ hiệu lực: không hiện gì
+  return el("span", { class: `legal-badge ${legal.code}`, text: legal.label, title: legal.note || legal.label });
+}
+
 function docRow(d) {
   const meta = [];
+  if (d.so_hieu) meta.push(d.so_hieu);
   if (d.n_pages) meta.push(`${d.n_pages} trang`);
   meta.push(`${d.n_chunks} đoạn`);
   const row = el("li", { class: `doc-item ${state.flashDocs.has(d.id) ? "done-flash" : ""}` },
@@ -387,13 +400,33 @@ function docRow(d) {
     el("div", { class: "doc-main" },
       el("div", { class: "doc-title", text: d.title, title: d.source }),
       el("div", { class: "doc-meta" }, meta.join(" · "), d.n_ocr_pages ? el("span", { class: "ocr", text: ` · OCR ${d.n_ocr_pages} trang` }) : null),
+      legalBadge(d.legal),
     ),
+    el("button", { class: "icon-btn small", icon: "edit", title: "Thông tin hiệu lực", "aria-label": `Thông tin hiệu lực của ${d.title}`, onclick: () => openLegalDialog(d) }),
     el("button", { class: "icon-btn small danger-hover", icon: "trash", title: "Xóa tài liệu", "aria-label": `Xóa ${d.title}`, onclick: () => deleteDoc(d, row) }),
   );
   return row;
 }
 
+/** PDF cần OCR nhiều trang: hỏi trước khi tốn nhiều lượt gọi model. */
+function confirmRow(label, p) {
+  const forget = () => {
+    pendingOf(state.currentId).delete(label);
+    renderDocs();
+  };
+  return el("li", { class: "doc-item confirm", "data-pending": label },
+    docBadge(null, label),
+    el("div", { class: "doc-main" },
+      el("div", { class: "doc-title", text: label.replace(/^https?:\/\//, ""), title: label }),
+      el("div", { class: "doc-meta", text: `${p.confirm.message}. Tiếp tục?` }),
+      el("div", { class: "confirm-actions" },
+        el("button", { class: "btn primary small", type: "button", onclick: () => { forget(); p.retry(); } }, `OCR ${p.confirm.ocr_pages} trang`),
+        el("button", { class: "btn ghost small", type: "button", onclick: forget }, "Bỏ qua"))),
+  );
+}
+
 function pendingRow(label, p) {
+  if (p.confirm) return confirmRow(label, p);
   const bar = el("div", { class: `progress ${p.ratio == null ? "indeterminate" : ""}` },
     el("span", { style: p.ratio == null ? "" : `width:${Math.round(p.ratio * 100)}%` }));
   return el("li", { class: `doc-item ${p.error ? "error" : "pending"}`, "data-pending": label },
@@ -429,7 +462,7 @@ function updatePendingRow(cid, label) {
   if (cid !== state.currentId) return;
   const p = pendingOf(cid).get(label);
   const node = [...document.querySelectorAll("[data-pending]")].find((n) => n.dataset.pending === label);
-  if (!node || !p || p.error) return renderDocs();
+  if (!node || !p || p.error || p.confirm || !node.querySelector(".progress")) return renderDocs();
   node.querySelector(".doc-meta").textContent = p.message || "Đang xử lý...";
   const bar = node.querySelector(".progress");
   bar.classList.toggle("indeterminate", p.ratio == null);
@@ -465,11 +498,13 @@ async function refreshAfterIngest(cid, newIds = []) {
   if (cid === state.currentId) await loadDocs();
 }
 
-/** Nạp file hoặc link. kind: "files" | "urls". Trả về số tài liệu nạp thành công. */
-async function ingest(kind, items, cid = state.currentId) {
+/** Nạp file hoặc link. kind: "files" | "urls". confirmOcr: người dùng đã đồng ý OCR nhiều trang.
+ * Trả về số tài liệu nạp thành công. */
+async function ingest(kind, items, cid = state.currentId, confirmOcr = false) {
   if (!cid || !items.length) return 0;
   const pending = pendingOf(cid);
   const labels = kind === "files" ? items.map((f) => f.name) : items;
+  const itemOf = new Map(labels.map((l, i) => [l, items[i]]));
   labels.forEach((l) => pending.set(l, { message: "Đang chờ...", ratio: null }));
   if (cid === state.currentId) renderDocs();
 
@@ -479,11 +514,12 @@ async function ingest(kind, items, cid = state.currentId) {
     items.forEach((f) => form.append("files", f, f.name));
     init = { method: "POST", body: form };
   } else {
-    init = jsonInit({ urls: items });
+    init = jsonInit({ urls: items, confirm_ocr: confirmOcr });
   }
+  const query = kind === "files" && confirmOcr ? "?confirm_ocr=true" : "";
   const added = [];
   try {
-    await stream(`/api/collections/${cid}/${kind}`, init, (ev) => {
+    await stream(`/api/collections/${cid}/${kind}${query}`, init, (ev) => {
       const p = pending.get(ev.item);
       if (ev.type === "start" && p) {
         p.message = kind === "files" ? "Đang đọc file..." : "Đang tải trang...";
@@ -502,10 +538,15 @@ async function ingest(kind, items, cid = state.currentId) {
         pending.set(ev.item, { error: ev.message });
         toast("error", ev.message, 7000);
         if (cid === state.currentId) renderDocs();
+      } else if (ev.type === "item_confirm") {
+        // Chưa OCR gì: giữ file/link lại để gửi lại khi người dùng đồng ý.
+        pending.set(ev.item, { confirm: ev, retry: () => ingest(kind, [itemOf.get(ev.item)], cid, true) });
+        toast("info", `“${ev.item}”: ${ev.message}. Bấm “OCR” trong danh sách tài liệu để tiếp tục.`, 7000);
+        if (cid === state.currentId) renderDocs();
       }
     });
   } catch (e) {
-    labels.forEach((l) => pending.has(l) && pending.set(l, { error: e.message }));
+    labels.forEach((l) => pending.has(l) && !pending.get(l).confirm && pending.set(l, { error: e.message }));
     toast("error", e.message, 7000);
   }
   if (cid === state.currentId) renderDocs();
@@ -621,8 +662,49 @@ function renderMessages() {
   messagesBox.replaceChildren(...(loading
     ? [el("div", { class: "welcome" }, el("div", { class: "welcome-mark", icon: "bot" }))]
     : msgs.length ? msgs.map((m) => messageEl(m, cid, conv)) : [welcome()]));
-  if (conv != null && state.thinking.has(conv)) messagesBox.append(thinkingEl(state.thinking.get(conv)));
+  if (conv != null && state.streaming.has(conv)) messagesBox.append(streamingEl(state.streaming.get(conv)));
+  else if (conv != null && state.thinking.has(conv)) messagesBox.append(thinkingEl(state.thinking.get(conv)));
   scrollToBottom(false);
+}
+
+/** Đặt con trỏ nhấp nháy (phần tử cuối) vào cuối khối cuối cùng thay vì xuống dòng riêng. */
+function placeCaret(content) {
+  const caret = content.lastElementChild;
+  const lastBlock = caret?.previousElementSibling;
+  if (!lastBlock) return;
+  const items = lastBlock.matches("ul, ol") ? lastBlock.querySelectorAll("li") : [];
+  (items.length ? items[items.length - 1] : lastBlock).append(caret);
+}
+
+function renderStreaming(content, text) {
+  content.innerHTML = renderMarkdown(text) + '<span class="caret"></span>'; // renderMarkdown escape HTML trước
+  placeCaret(content);
+}
+
+function streamingEl(text) {
+  const content = el("div", { class: "md" });
+  renderStreaming(content, text);
+  return el("div", { class: "msg bot streaming", id: "streaming", "data-started": performance.now() },
+    el("div", { class: "avatar", icon: "bot" }), el("div", { class: "body" }, content));
+}
+
+/** Hiện phần câu trả lời model đã viết được, thay cho dòng trạng thái. null: đã xong
+ * (pushMessage thay khung này bằng tin nhắn hoàn chỉnh kèm nguồn). */
+function setStreaming(conv, text) {
+  if (text == null) {
+    state.streaming.delete(conv);
+    return;
+  }
+  state.streaming.set(conv, text);
+  if (conv !== openConvId()) return;
+  const stick = nearBottom();
+  const node = $("#streaming");
+  if (node) renderStreaming(node.querySelector(".md"), text);
+  else {
+    $("#thinking")?.remove();
+    messagesBox.append(streamingEl(text));
+  }
+  if (stick) chat.scrollTop = chat.scrollHeight;
 }
 
 function thinkingEl(text) {
@@ -644,7 +726,7 @@ function setThinking(conv, text) {
   const isNew = !state.thinking.has(conv);
   state.thinking.set(conv, text);
   if (isNew && !historyPanel.hidden) renderHistory();
-  if (!shown) return;
+  if (!shown || state.streaming.has(conv)) return;
   const node = $("#thinking");
   if (isNew || !node) {
     messagesBox.append(thinkingEl(text));
@@ -695,17 +777,29 @@ function sourcesEl(m, cid) {
   });
   const grid = el("div", { class: "source-grid" },
     m.sources.map((s, i) => {
-      const title = s.url
-        ? el("a", { href: s.url, target: "_blank", rel: "noopener noreferrer", text: s.title })
+      // Tài liệu trong bộ: mở file gốc (PDF mở đúng trang); trang web: mở link.
+      const file = m.kind === "docs" && s.doc_id
+        ? `/api/documents/${encodeURIComponent(s.doc_id)}/file${s.page ? `#page=${s.page}` : ""}` : "";
+      const href = file || s.url;
+      const title = href
+        ? el("a", { href, target: "_blank", rel: "noopener noreferrer", text: s.title })
         : document.createTextNode(s.title);
       const excerpt = el("div", { class: "source-excerpt", text: s.excerpt, title: "Bấm để xem đầy đủ" });
       excerpt.addEventListener("click", () => excerpt.classList.toggle("expanded"));
-      const actions = s.url ? el("div", { class: "source-actions" }, addSourceButton(s, cid)) : null;
+      const status = s.status
+        ? el("div", { class: `source-status ${s.status}`, icon: "warn" }, s.status_label + (s.status_note ? ` · ${s.status_note}` : ""))
+        : null;
+      const actions = file
+        ? el("div", { class: "source-actions" },
+          el("a", { class: "btn ghost small", href: file, target: "_blank", rel: "noopener noreferrer", icon: "open" },
+            s.page ? `Mở file gốc · trang ${s.page}` : "Mở file gốc"))
+        : s.url ? el("div", { class: "source-actions" }, addSourceButton(s, cid)) : null;
       return el("div", { class: "source-card", "data-n": s.n, style: `--i:${i}` },
         el("span", { class: "source-num", text: s.n }),
         el("div", { class: "source-body" },
           el("div", { class: "source-title" }, title),
           s.location ? el("div", { class: "source-loc", text: s.location }) : null,
+          status,
           excerpt,
           actions));
     }));
@@ -800,14 +894,7 @@ function typewrite(m, cid, conv) {
     const space = text.indexOf(" ", n);
     n = t >= 1 ? text.length : space === -1 ? text.length : space;
     content.innerHTML = renderMarkdown(text.slice(0, n)) + (t < 1 ? '<span class="caret"></span>' : "");
-    if (t < 1 && content.lastElementChild?.previousElementSibling) {
-      // Đặt con trỏ vào cuối khối cuối cùng thay vì xuống dòng riêng.
-      const caret = content.lastElementChild;
-      const lastBlock = caret.previousElementSibling;
-      const items = lastBlock.matches("ul, ol") ? lastBlock.querySelectorAll("li") : [];
-      const target = items.length ? items[items.length - 1] : lastBlock;
-      target.append(caret);
-    }
+    if (t < 1) placeCaret(content);
     if (stick) chat.scrollTop = chat.scrollHeight;
     if (t < 1) requestAnimationFrame(frame);
     else {
@@ -824,7 +911,16 @@ function pushMessage(conv, m) {
   if (conv !== openConvId()) return;
   if (!messagesBox.querySelector(".msg")) messagesBox.replaceChildren();
   $("#thinking")?.remove();
-  if (m.role === "assistant") typewrite(m, state.currentId, conv);
+  const live = $("#streaming");
+  // Một số gateway (như Wellflow) gom cả câu trả lời rồi mới gửi dồn một lúc: khi đó vẫn hiện dần như gõ chữ.
+  const burst = live && performance.now() - Number(live.dataset.started) < 400;
+  if (burst) live.remove();
+  if (m.role === "assistant" && live && !burst) {
+    // Câu trả lời đã hiện dần trong lúc model viết: thay bằng bản hoàn chỉnh kèm nguồn, không gõ lại.
+    const node = messageEl(m, state.currentId, conv);
+    node.style.animation = "none";
+    live.replaceWith(node);
+  } else if (m.role === "assistant") typewrite(m, state.currentId, conv);
   else {
     messagesBox.append(messageEl(m, state.currentId, conv));
     scrollToBottom();
@@ -833,6 +929,18 @@ function pushMessage(conv, m) {
 }
 
 const localId = () => `local-${uid()}`;
+
+/** Xử lý sự kiện khi đang trả lời: dòng trạng thái, rồi chữ hiện dần ("delta"; "reset" khi model làm lại từ đầu). */
+function onAnswerEvent(conv) {
+  let text = "";
+  return (ev) => {
+    if (ev.type === "status") setThinking(conv, ev.message);
+    else if (ev.type === "delta") {
+      text = ev.reset ? ev.text : text + ev.text;
+      setStreaming(conv, text);
+    }
+  };
+}
 
 async function askQuestion(text) {
   const cid = state.currentId;
@@ -867,13 +975,13 @@ async function askQuestion(text) {
   setThinking(conv, "Đang đọc câu hỏi...");
   refreshComposer();
   try {
-    const result = await stream(`/api/conversations/${conv}/ask`, jsonInit({ question }), (ev) => {
-      if (ev.type === "status") setThinking(conv, ev.message);
-    });
+    const result = await stream(`/api/conversations/${conv}/ask`, jsonInit({ question }), onAnswerEvent(conv));
     setThinking(conv, null);
+    setStreaming(conv, null);
     pushMessage(conv, result.message);
   } catch (e) {
     setThinking(conv, null);
+    setStreaming(conv, null);
     pushMessage(conv, { id: localId(), role: "assistant", kind: "error", text: e.message, question });
   }
   refreshComposer();
@@ -887,17 +995,18 @@ async function webSearch(m, cid, conv) {
   setThinking(conv, "Đang tìm trên internet...");
   refreshComposer();
   try {
-    const result = await stream(`/api/conversations/${conv}/messages/${m.id}/web`, jsonInit({ query }), (ev) => {
-      if (ev.type === "status") setThinking(conv, ev.message);
-    });
+    const result = await stream(`/api/conversations/${conv}/messages/${m.id}/web`, jsonInit({ query }), onAnswerEvent(conv));
     Object.assign(m.offer, { state: "done", query });
     rerenderMessage(m, cid, conv);
     setThinking(conv, null);
+    setStreaming(conv, null);
     pushMessage(conv, result.message);
   } catch (e) {
     m.offer.state = "open";
     rerenderMessage(m, cid, conv);
     setThinking(conv, null);
+    setStreaming(conv, null);
+    $("#streaming")?.remove();
     toast("error", e.message, 7000);
   }
   refreshComposer();
@@ -1394,6 +1503,51 @@ $("#password-form").addEventListener("submit", async (e) => {
     toast("success", "Đã đổi mật khẩu");
   } catch (err) {
     setFormError("#pw-error", err.message);
+  }
+});
+
+// Thông tin hiệu lực của tài liệu
+let legalDoc = null;
+
+function openLegalDialog(d) {
+  legalDoc = d;
+  $("#legal-doc").textContent = d.title;
+  $("#legal-so-hieu").value = d.so_hieu || "";
+  $("#legal-effective").value = d.effective_date || "";
+  $("#legal-status").value = d.legal?.manual ? d.legal.code : "";
+  $("#legal-note").value = d.legal?.manual ? d.legal.note : "";
+  setFormError("#legal-error", "");
+  updateLegalForm();
+  $("#legal-dialog").showModal();
+}
+
+function updateLegalForm() {
+  const manual = $("#legal-status").value !== "";
+  $("#legal-note-field").hidden = !manual;
+  const auto = legalDoc?.legal && !legalDoc.legal.manual && legalDoc.legal.label
+    ? `Hiện tự nhận diện là “${legalDoc.legal.label}”${legalDoc.legal.note ? `: ${legalDoc.legal.note}` : ""}.` : "";
+  $("#legal-auto").textContent = manual ? ""
+    : auto || "Tự nhận diện từ nội dung văn bản và các văn bản khác trong bộ (văn bản thay thế, sửa đổi, ngày có hiệu lực).";
+}
+$("#legal-status").addEventListener("change", updateLegalForm);
+
+$("#legal-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = $("#legal-status").value;
+  const body = {
+    so_hieu: $("#legal-so-hieu").value.trim(),
+    effective_date: $("#legal-effective").value,
+    status,
+    status_note: status ? $("#legal-note").value.trim() : "",
+  };
+  try {
+    await api(`/api/collections/${legalDoc.collection_id}/documents/${legalDoc.id}`, { method: "PATCH", body });
+    $("#legal-dialog").close();
+    toast("success", "Đã lưu thông tin hiệu lực");
+    // Đổi một văn bản có thể làm đổi trạng thái của văn bản khác trong bộ.
+    if (legalDoc.collection_id === state.currentId) await loadDocs();
+  } catch (err) {
+    setFormError("#legal-error", err.message);
   }
 });
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from ..providers import LLM, Embedder
 from ..store import Database, Document, StoredChunk, VectorStore
 from .chunker import chunk_document
+from .legal import analyze
 from .loaders import OCR_INSTRUCTION, LoadedDoc, LoadError, Page, ProgressFn, _noop, load_file, load_url
 
 # Đánh dấu bộ tài liệu đang re-index dở: khác mọi model_id nên UI vẫn hiện nút Re-index.
@@ -28,8 +29,11 @@ class IngestResult:
 
 
 class Ingestor:
+    """llm: model dùng để OCR trang scan (None: không OCR được)."""
+
     def __init__(self, db: Database, vectors: VectorStore, embedder: Embedder, llm: LLM | None,
-                 data_dir: Path, ocr_workers: int = 4):
+                 data_dir: Path, ocr_workers: int = 4, ocr_confirm_pages: int = 0,
+                 allow_private_urls: bool = False, max_bytes: int | None = None):
         self.db = db
         self.vectors = vectors
         self.embedder = embedder
@@ -37,8 +41,14 @@ class Ingestor:
         self.files_dir = data_dir / "files"
         self.texts_dir = data_dir / "texts"
         self.ocr_workers = ocr_workers
+        self.ocr_confirm_pages = ocr_confirm_pages
+        self.allow_private_urls = allow_private_urls
+        self.max_bytes = max_bytes
         self.files_dir.mkdir(parents=True, exist_ok=True)
         self.texts_dir.mkdir(parents=True, exist_ok=True)
+
+    def _max_ocr(self, confirmed: bool) -> int | None:
+        return None if confirmed or not self.ocr_confirm_pages else self.ocr_confirm_pages
 
     def _ocr(self, png: bytes) -> str:
         return self.llm.ocr(png, OCR_INSTRUCTION)
@@ -57,22 +67,26 @@ class Ingestor:
                 f"{self.embedder.model_id}. Hãy bấm Re-index trước khi nạp thêm."
             )
 
-    def ingest_file(self, collection_id: int, filename: str, data: bytes, progress: ProgressFn = _noop) -> IngestResult:
+    def ingest_file(self, collection_id: int, filename: str, data: bytes, progress: ProgressFn = _noop,
+                    confirm_ocr: bool = False) -> IngestResult:
+        """confirm_ocr: người dùng đã đồng ý OCR dù số trang scan vượt OCR_CONFIRM_PAGES."""
         self._check_embed_model(collection_id)
         content_hash = hashlib.sha256(data).hexdigest()
         if dup := self.db.find_by_hash(collection_id, content_hash):
             raise DuplicateError(f"'{filename}' đã có trong bộ tài liệu (trùng với '{dup.title}')")
         ocr = self._ocr if self.llm else None
-        doc = load_file(filename, data, ocr, progress, self.ocr_workers)
+        doc = load_file(filename, data, ocr, progress, self.ocr_workers, self._max_ocr(confirm_ocr))
         return self._store(collection_id, doc, content_hash, progress)
 
-    def ingest_url(self, collection_id: int, url: str, progress: ProgressFn = _noop) -> IngestResult:
+    def ingest_url(self, collection_id: int, url: str, progress: ProgressFn = _noop,
+                   confirm_ocr: bool = False) -> IngestResult:
         self._check_embed_model(collection_id)
         url = url.strip()
         if any(d.source == url for d in self.db.list_documents(collection_id)):
             raise DuplicateError(f"Link đã có trong bộ tài liệu: {url}")
         ocr = self._ocr if self.llm else None
-        doc = load_url(url, ocr, progress, self.ocr_workers)
+        doc = load_url(url, ocr, progress, self.ocr_workers, self._max_ocr(confirm_ocr),
+                       allow_private=self.allow_private_urls, max_bytes=self.max_bytes)
         content_hash = hashlib.sha256(doc.raw or doc.text.encode()).hexdigest()
         if dup := self.db.find_by_hash(collection_id, content_hash):
             raise DuplicateError(f"Nội dung link trùng với tài liệu '{dup.title}' đã có")
@@ -85,11 +99,14 @@ class Ingestor:
         doc_id = uuid.uuid4().hex
         stored, embeddings = self._embed_chunks(doc_id, doc.title, doc.source, doc.source_type, doc.pages, progress)
         n_ocr = sum(p.ocr for p in doc.pages)
+        legal = analyze(doc.text)
         record = Document(
             id=doc_id, collection_id=collection_id, title=doc.title, source=doc.source,
             source_type=doc.source_type, content_hash=content_hash,
             n_pages=sum(p.number is not None for p in doc.pages) or None, n_ocr_pages=n_ocr,
             n_chunks=len(stored), created_at="",
+            so_hieu=legal.so_hieu, issued_date=legal.issued_date, effective_date=legal.effective_date,
+            replaces=legal.replaces, amends=legal.amends,
         )
 
         # Lưu văn bản đã trích (kể cả OCR) để re-index sau này không phải OCR lại.
@@ -148,6 +165,26 @@ class Ingestor:
             self._remove_files(d.id)
         self.vectors.drop(collection_id)
         self.db.delete_collection(collection_id)
+
+    def raw_file(self, doc_id: str) -> Path | None:
+        """File gốc đã lưu (PDF/Word/TXT); None với trang web, vì chỉ lưu chữ đã trích."""
+        return next(self.files_dir.glob(f"{doc_id}.*"), None)
+
+    def backfill_legal_info(self) -> int:
+        """Đọc thông tin hiệu lực cho tài liệu nạp từ phiên bản cũ, từ văn bản đã lưu. Trả về số tài liệu đã đọc."""
+        n = 0
+        for col in self.db.list_collections():
+            for d in self.db.list_documents(col.id):
+                path = self.texts_dir / f"{d.id}.json"
+                if d.so_hieu is not None or not path.exists():
+                    continue
+                pages = json.loads(path.read_text(encoding="utf-8"))["pages"]
+                legal = analyze("\n\n".join(p["text"] for p in pages))
+                self.db.update_document(d.id, so_hieu=legal.so_hieu, issued_date=legal.issued_date,
+                                        effective_date=legal.effective_date, replaces=legal.replaces,
+                                        amends=legal.amends)
+                n += 1
+        return n
 
     def _remove_files(self, doc_id: str) -> None:
         (self.texts_dir / f"{doc_id}.json").unlink(missing_ok=True)

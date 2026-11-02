@@ -54,6 +54,15 @@ class VectorStore:
         res = self._col(collection_id).get(ids=ids, include=["documents", "metadatas"])
         return [StoredChunk(id=i, text=d, meta=m) for i, d, m in zip(res["ids"], res["documents"], res["metadatas"])]
 
+    def find(self, collection_id: int, where: dict, limit: int | None = None) -> list[StoredChunk]:
+        """Lấy các đoạn theo metadata, ví dụ {"article": "Điều 5"}; xếp theo thứ tự trong tài liệu."""
+        col = self._col(collection_id)
+        if col.count() == 0:
+            return []
+        res = col.get(where=where, limit=limit, include=["documents", "metadatas"])
+        chunks = [StoredChunk(id=i, text=d, meta=m) for i, d, m in zip(res["ids"], res["documents"], res["metadatas"])]
+        return sorted(chunks, key=lambda c: c.id)
+
     def delete_document(self, collection_id: int, doc_id: str) -> None:
         self._col(collection_id).delete(where={"doc_id": doc_id})
 

@@ -1,10 +1,16 @@
 import io
+import socket
 
 import docx
+import httpx
 import pymupdf
 import pytest
+from conftest import scanned_pdf
 
-from ragbot.ingest.loaders import LoadError, load_file, load_pdf, looks_garbled
+from ragbot.ingest.loaders import LoadError, OcrConfirmationNeeded, load_file, load_pdf, load_url, looks_garbled
+
+PAGE_HTML = ("<html><head><title>Trang nội bộ</title></head><body><article>"
+             + "<p>Nội dung trang nội bộ của công ty, dài đủ để trích ra được.</p>" * 10 + "</article></body></html>")
 
 TEXT = "Article 1. This page has a real text layer with more than fifty characters of content."
 
@@ -47,15 +53,57 @@ def test_signed_scan_with_text_overlay_still_ocr():
 
 
 def test_many_scanned_pages_all_ocr():
-    src = pymupdf.open(stream=_pdf_with_scanned_page())
-    scan = src[1].get_pixmap(dpi=50).tobytes("png")
-    for _ in range(10):
-        src.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=scan)
     calls, progress = [], []
-    pages = load_pdf(src.tobytes(), lambda png: calls.append(1) or "x" * 60, progress.append, workers=3)
+    pages = load_pdf(scanned_pdf(11), lambda png: calls.append(1) or "x" * 60, progress.append, workers=3)
     assert len(pages) == 12 and len(calls) == 11
     assert [p.ocr for p in pages] == [False] + [True] * 11
     assert progress[-1] == "OCR 11/11 trang"
+
+
+def test_too_many_scanned_pages_asks_before_ocr():
+    calls = []
+    with pytest.raises(OcrConfirmationNeeded) as e:
+        load_pdf(scanned_pdf(11), lambda png: calls.append(1) or "x", max_ocr_pages=5)
+    assert (e.value.ocr_pages, e.value.total_pages) == (11, 12)
+    assert calls == []  # chưa tốn lượt gọi model nào
+    assert len(load_pdf(scanned_pdf(11), lambda png: "x" * 60, max_ocr_pages=11)) == 12
+
+
+def _fake_dns(monkeypatch, table: dict[str, str]):
+    def getaddrinfo(host, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (table[host], 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8000/api/users", "http://[::1]/", "http://169.254.169.254/latest",
+                                 "http://192.168.1.10/", "http://10.0.0.5/"])
+def test_internal_addresses_blocked(url):
+    with pytest.raises(LoadError, match="nội bộ"):
+        load_url(url, None)
+
+
+def test_redirect_to_internal_address_blocked(monkeypatch):
+    _fake_dns(monkeypatch, {"public.example": "93.184.216.34", "internal.example": "10.0.0.5"})
+
+    def handler(request):
+        if request.url.host == "public.example":
+            return httpx.Response(302, headers={"location": "http://internal.example/secret"})
+        return httpx.Response(200, html=PAGE_HTML)
+
+    transport = httpx.MockTransport(handler)
+    with pytest.raises(LoadError, match="nội bộ"):
+        load_url("http://public.example/x", None, transport=transport)
+    # ALLOW_PRIVATE_URLS=true: cho phép (khi mọi tài khoản đều đáng tin).
+    doc = load_url("http://public.example/x", None, allow_private=True, transport=transport)
+    assert "Nội dung trang nội bộ" in doc.text
+
+
+def test_download_size_limit(monkeypatch):
+    _fake_dns(monkeypatch, {"public.example": "93.184.216.34"})
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, content=b"%PDF-" + b"x" * 5000))
+    with pytest.raises(LoadError, match="lớn hơn giới hạn"):
+        load_url("http://public.example/big.pdf", None, max_bytes=1000, transport=transport)
 
 
 def test_scanned_pdf_without_llm_fails_clearly():

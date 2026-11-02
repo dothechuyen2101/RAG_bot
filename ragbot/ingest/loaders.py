@@ -1,5 +1,7 @@
 import io
+import ipaddress
 import re
+import socket
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -35,6 +37,15 @@ OcrFn = Callable[[bytes], str]
 
 class LoadError(RuntimeError):
     pass
+
+
+class OcrConfirmationNeeded(LoadError):
+    """PDF cần OCR nhiều trang hơn mức cho phép: hỏi người dùng trước khi tốn nhiều lượt gọi model."""
+
+    def __init__(self, ocr_pages: int, total_pages: int):
+        super().__init__(f"PDF có {ocr_pages}/{total_pages} trang scan cần OCR, mỗi trang tốn 1 lượt gọi model")
+        self.ocr_pages = ocr_pages
+        self.total_pages = total_pages
 
 
 @dataclass
@@ -91,7 +102,9 @@ def _render(page: "pymupdf.Page") -> bytes:
     return page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY).tobytes("png")
 
 
-def load_pdf(data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4) -> list[Page]:
+def load_pdf(data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4,
+             max_ocr_pages: int | None = None) -> list[Page]:
+    """max_ocr_pages: cần OCR nhiều trang hơn mức này thì ném OcrConfirmationNeeded (None: không giới hạn)."""
     try:
         doc = pymupdf.open(stream=data, filetype="pdf")
     except Exception as e:
@@ -110,6 +123,8 @@ def load_pdf(data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, wo
             return pages
         if ocr_fn is None:
             raise LoadError(f"{len(need_ocr)} trang cần OCR nhưng chưa cấu hình LLM")
+        if max_ocr_pages and len(need_ocr) > max_ocr_pages:
+            raise OcrConfirmationNeeded(len(need_ocr), len(pages))
 
         progress(f"PDF có {len(need_ocr)}/{len(pages)} trang scan, đang OCR...")
         workers = max(1, workers)
@@ -129,7 +144,7 @@ def load_pdf(data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, wo
                     i = pending.pop(fut)
                     pages[i] = Page(number=i + 1, text=fut.result().strip(), ocr=True)
                     done += 1
-                    # progress gọi từ thread chính vì Streamlit không cho ghi UI từ thread khác.
+                    # Dạng "OCR n/m" được api.py đọc để vẽ thanh tiến trình.
                     progress(f"OCR {done}/{len(need_ocr)} trang")
     return pages
 
@@ -148,11 +163,12 @@ def load_text(data: bytes) -> list[Page]:
 
 
 def load_file(
-    filename: str, data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4
+    filename: str, data: bytes, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4,
+    max_ocr_pages: int | None = None,
 ) -> LoadedDoc:
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
-        pages, kind = load_pdf(data, ocr_fn, progress, workers), "pdf"
+        pages, kind = load_pdf(data, ocr_fn, progress, workers, max_ocr_pages), "pdf"
     elif ext == ".docx":
         pages, kind = load_docx(data), "docx"
     elif ext in {".txt", ".md"}:
@@ -163,14 +179,57 @@ def load_file(
     return LoadedDoc(title=title, source=filename, source_type=kind, pages=pages, raw=data, extension=ext)
 
 
-def load_url(url: str, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4) -> LoadedDoc:
+def check_public_host(url: str) -> None:
+    """Chặn link tới địa chỉ nội bộ (localhost, mạng LAN, địa chỉ metadata của cloud...), để người dùng
+    không mượn server đọc các trang trong mạng nội bộ rồi xem nội dung qua trích dẫn."""
+    host = urlparse(url).hostname
+    if not host:
+        raise LoadError(f"Link không hợp lệ: {url}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError) as e:
+        raise LoadError(f"Không tìm thấy tên miền {host}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])  # bỏ "%scope" của IPv6 link-local
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if not (mapped or ip).is_global:
+            raise LoadError(f"Không nạp được link tới địa chỉ nội bộ ({host})")
+
+
+def _read_limited(resp: httpx.Response, max_bytes: int | None, url: str) -> bytes:
+    def too_big() -> LoadError:
+        return LoadError(f"Nội dung tại {url} lớn hơn giới hạn {max_bytes / 1024 / 1024:g} MB")
+
+    if max_bytes and int(resp.headers.get("content-length") or 0) > max_bytes:
+        raise too_big()
+    buf = bytearray()
+    for chunk in resp.iter_bytes():
+        buf += chunk
+        if max_bytes and len(buf) > max_bytes:
+            raise too_big()
+    return bytes(buf)
+
+
+def load_url(url: str, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, workers: int = 4,
+             max_ocr_pages: int | None = None, allow_private: bool = False, max_bytes: int | None = None,
+             transport: httpx.BaseTransport | None = None) -> LoadedDoc:
+    """transport: chỉ dùng trong test."""
     url = url.strip()
     if urlparse(url).scheme not in {"http", "https"}:
         raise LoadError(f"Link không hợp lệ: {url}")
+
+    def guard(request: httpx.Request) -> None:
+        # Chạy trước MỖI request, kể cả khi trang chuyển hướng sang địa chỉ khác.
+        if not allow_private:
+            check_public_host(str(request.url))
+
     progress(f"Đang tải {url}")
     try:
-        resp = httpx.get(url, follow_redirects=True, timeout=60, headers={"User-Agent": USER_AGENT})
-        resp.raise_for_status()
+        with httpx.Client(follow_redirects=True, timeout=60, headers={"User-Agent": USER_AGENT},
+                          event_hooks={"request": [guard]}, transport=transport) as client:
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                content = _read_limited(resp, max_bytes, url)
     except httpx.HTTPStatusError as e:
         raise LoadError(f"Trang trả về lỗi {e.response.status_code}: {url}") from e
     except httpx.HTTPError as e:
@@ -179,13 +238,13 @@ def load_url(url: str, ocr_fn: OcrFn | None, progress: ProgressFn = _noop, worke
     content_type = resp.headers.get("content-type", "").lower()
     name = Path(urlparse(str(resp.url)).path).name or urlparse(url).netloc
 
-    if "pdf" in content_type or resp.content[:5] == b"%PDF-":
-        pages = load_pdf(resp.content, ocr_fn, progress, workers)
-        return LoadedDoc(Path(name).stem or url, url, "url", pages, raw=resp.content, extension=".pdf")
+    if "pdf" in content_type or content[:5] == b"%PDF-":
+        pages = load_pdf(content, ocr_fn, progress, workers, max_ocr_pages)
+        return LoadedDoc(Path(name).stem or url, url, "url", pages, raw=content, extension=".pdf")
     if "officedocument.wordprocessingml" in content_type:
-        return LoadedDoc(Path(name).stem or url, url, "url", load_docx(resp.content), raw=resp.content, extension=".docx")
+        return LoadedDoc(Path(name).stem or url, url, "url", load_docx(content), raw=content, extension=".docx")
 
-    html = resp.text
+    html = content.decode(resp.encoding or "utf-8", errors="replace")
     text = trafilatura.extract(html, url=url, include_tables=True, favor_recall=True, output_format="markdown")
     if not text or len(text.strip()) < MIN_TEXT_CHARS:
         raise LoadError(

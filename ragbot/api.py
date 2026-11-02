@@ -16,23 +16,25 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .answer import Answer, answer_from_docs, answer_from_web
 from .auth import SESSION_COOKIE, Accounts, AuthError, TooManyAttempts
 from .config import get_settings
-from .ingest import DuplicateError, EmbedModelMismatch, IngestResult, LoadError
+from .ingest import DuplicateError, EmbedModelMismatch, IngestResult, LoadError, OcrConfirmationNeeded
+from .ingest.legal import collection_statuses
 from .providers import MissingKeyError
 from .providers.base import QuotaExhaustedError
 from .services import Services, build_services
-from .store import Collection, Conversation, User
+from .store import Collection, Conversation, Document, User
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 TITLE_CHARS = 80
@@ -41,6 +43,13 @@ OCR_PROGRESS = re.compile(r"OCR (\d+)/(\d+)")
 USER_ERRORS = (LoadError, DuplicateError, EmbedModelMismatch, MissingKeyError, QuotaExhaustedError)
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+DOC_ID_RE = re.compile(r"[0-9a-f]{32}")
+FILE_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/plain; charset=utf-8",
+}
 
 Emit = Callable[[dict], None]
 
@@ -69,6 +78,15 @@ class NewCollection(BaseModel):
 
 class UrlList(BaseModel):
     urls: list[str]
+    confirm_ocr: bool = False
+
+
+class DocumentUpdate(BaseModel):
+    """Sửa thông tin hiệu lực; trường để None thì giữ nguyên."""
+    so_hieu: str | None = Field(None, max_length=60)
+    effective_date: str | None = None  # YYYY-MM-DD hoặc "" để xóa
+    status: Literal["", "in_force", "amended", "expired"] | None = None  # "" = để app tự nhận diện
+    status_note: str | None = Field(None, max_length=300)
 
 
 class SavedSource(BaseModel):
@@ -77,6 +95,11 @@ class SavedSource(BaseModel):
     location: str = ""
     excerpt: str = ""
     url: str = ""
+    doc_id: str = ""
+    page: int = 0
+    status: str = ""
+    status_label: str = ""
+    status_note: str = ""
 
 
 class SavedOffer(BaseModel):
@@ -133,6 +156,33 @@ def history_of(messages: list[dict]) -> list[dict]:
 
 def user_json(user: User | None) -> dict | None:
     return asdict(user) if user else None
+
+
+def text_stream(emit: Emit) -> Callable[[str], None]:
+    """Nhận toàn bộ chữ đã sinh, gửi phần mới dạng {"type": "delta"}. Khi model làm lại từ đầu
+    (chuyển sang model dự phòng), gửi lại cả đoạn kèm "reset" để giao diện thay chữ cũ."""
+    sent = ""
+
+    def on_text(text: str) -> None:
+        nonlocal sent
+        if text == sent:
+            return
+        if text.startswith(sent):
+            emit({"type": "delta", "text": text[len(sent):]})
+        else:
+            emit({"type": "delta", "text": text, "reset": True})
+        sent = text
+
+    return on_text
+
+
+def documents_json(docs: list[Document]) -> list[dict]:
+    statuses = collection_statuses(docs)
+    return [{**asdict(d), "legal": {**asdict(statuses[d.id]), "label": statuses[d.id].label}} for d in docs]
+
+
+def too_big(name: str, max_bytes: int):
+    raise LoadError(f"'{name}' lớn hơn giới hạn {max_bytes / 1024 / 1024:g} MB (đổi MAX_UPLOAD_MB trong .env)")
 
 
 def stream(work: Callable[[Emit], dict]) -> StreamingResponse:
@@ -312,7 +362,9 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
     @app.get("/api/info")
     def info(_: User = Depends(current_user)):
         s = svc()
-        return {"llm": s.llm.name, "embedder": s.embedder.model_id, "web_search": s.web is not None}
+        return {"llm": s.llm.name, "condense_llm": (s.condense_llm or s.llm).name,
+                "ocr_llm": s.ingestor.llm.name if s.ingestor.llm else None,
+                "embedder": s.embedder.model_id, "web_search": s.web is not None}
 
     @app.get("/api/collections")
     def list_collections(user: User = Depends(current_user)):
@@ -370,33 +422,83 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
                     ok += 1
                     emit({"type": "item_done", "item": label, "document": asdict(result.document),
                           "n_ocr_pages": result.n_ocr_pages})
+                except OcrConfirmationNeeded as e:
+                    # Chưa OCR gì: giao diện hỏi người dùng rồi gửi lại với confirm_ocr.
+                    emit({"type": "item_confirm", "item": label, "message": str(e),
+                          "ocr_pages": e.ocr_pages, "total_pages": e.total_pages})
                 except Exception as e:
                     emit({"type": "item_error", "item": label, "message": friendly_error(e)})
             return {"type": "done", "ok": ok, "total": len(items)}
 
         return stream(work)
 
+    def own_document(cid: int, doc_id: str, user: User) -> Document:
+        own_collection(cid, user)
+        doc = svc().db.get_document(doc_id)
+        if doc is None or doc.collection_id != cid:
+            raise HTTPException(404, "Tài liệu không tồn tại")
+        return doc
+
     @app.get("/api/collections/{cid}/documents")
     def list_documents(cid: int, user: User = Depends(current_user)):
         own_collection(cid, user)
-        return [asdict(d) for d in svc().db.list_documents(cid)]
+        return documents_json(svc().db.list_documents(cid))
+
+    @app.patch("/api/collections/{cid}/documents/{doc_id}")
+    def update_document(cid: int, doc_id: str, body: DocumentUpdate, user: User = Depends(current_user)):
+        own_document(cid, doc_id, user)
+        fields = body.model_dump(exclude_none=True)
+        if fields.get("effective_date"):
+            try:
+                fields["effective_date"] = date.fromisoformat(fields["effective_date"]).isoformat()
+            except ValueError:
+                raise HTTPException(400, "Ngày hiệu lực phải có dạng YYYY-MM-DD") from None
+        fields = {k: v.strip() if isinstance(v, str) else v for k, v in fields.items()}
+        db = svc().db
+        db.update_document(doc_id, **fields)
+        return next(d for d in documents_json(db.list_documents(cid)) if d["id"] == doc_id)
 
     @app.delete("/api/collections/{cid}/documents/{doc_id}", status_code=204)
     def delete_document(cid: int, doc_id: str, user: User = Depends(current_user)):
-        own_collection(cid, user)
-        if not any(d.id == doc_id for d in svc().db.list_documents(cid)):
-            raise HTTPException(404, "Tài liệu không tồn tại")
+        own_document(cid, doc_id, user)
         svc().ingestor.delete_document(cid, doc_id)
         return Response(status_code=204)
 
+    @app.get("/api/documents/{doc_id}/file")
+    def document_file(doc_id: str, user: User = Depends(current_user)):
+        """File gốc để mở từ trích dẫn (giao diện thêm #page=N để PDF mở đúng trang)."""
+        s = svc()
+        doc = s.db.get_document(doc_id) if DOC_ID_RE.fullmatch(doc_id) else None
+        col = s.db.get_collection(doc.collection_id) if doc else None
+        if col is None or col.owner_id != user.id:
+            raise HTTPException(404, "Tài liệu không tồn tại")
+        path = s.ingestor.raw_file(doc.id)
+        if path is None:
+            # Trang web chỉ lưu chữ đã trích: mở lại trang gốc.
+            if urlparse(doc.source).scheme in ("http", "https"):
+                return RedirectResponse(doc.source)
+            raise HTTPException(404, "Không còn file gốc của tài liệu này")
+        return FileResponse(path, media_type=FILE_TYPES.get(path.suffix, "application/octet-stream"),
+                            filename=f"{doc.title}{path.suffix}", content_disposition_type="inline",
+                            headers={"X-Content-Type-Options": "nosniff"})
+
     @app.post("/api/collections/{cid}/files")
-    async def upload_files(cid: int, files: list[UploadFile] = File(...), user: User = Depends(current_user)):
+    async def upload_files(cid: int, files: list[UploadFile] = File(...), confirm_ocr: bool = False,
+                           user: User = Depends(current_user)):
         own_collection(cid, user)
         ingestor = svc().ingestor
-        uploads = [(f.filename or "file", await f.read()) for f in files]
-        return ingest_items([
-            (name, lambda p, name=name, data=data: ingestor.ingest_file(cid, name, data, p)) for name, data in uploads
-        ])
+        limit = ingestor.max_bytes
+        items = []
+        for f in files:
+            name = f.filename or "file"
+            # f.size có sẵn khi upload xong: file quá lớn thì không đọc vào bộ nhớ.
+            data = None if limit and (f.size or 0) > limit else await f.read()
+            if data is None or (limit and len(data) > limit):
+                items.append((name, lambda p, name=name: too_big(name, limit)))
+            else:
+                items.append((name, lambda p, name=name, data=data: ingestor.ingest_file(cid, name, data, p,
+                                                                                         confirm_ocr=confirm_ocr)))
+        return ingest_items(items)
 
     @app.post("/api/collections/{cid}/urls")
     def add_urls(cid: int, body: UrlList, user: User = Depends(current_user)):
@@ -405,7 +507,8 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
         urls = [u.strip() for u in body.urls if u.strip()]
         if not urls:
             raise HTTPException(400, "Chưa có link nào")
-        return ingest_items([(u, lambda p, u=u: ingestor.ingest_url(cid, u, p)) for u in urls])
+        return ingest_items([(u, lambda p, u=u: ingestor.ingest_url(cid, u, p, confirm_ocr=body.confirm_ocr))
+                             for u in urls])
 
     # ---------------- cuộc trò chuyện & hỏi đáp ----------------
 
@@ -468,6 +571,7 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
                 ans = answer_from_docs(
                     s.llm, s.retriever, conv.collection_id, question, history, s.settings.top_k,
                     s.settings.min_similarity, progress=lambda m: emit({"type": "status", "message": m}),
+                    condense_llm=s.condense_llm, on_text=text_stream(emit),
                 )
             except Exception as e:
                 s.db.add_message(conv_id, {"role": "assistant", "kind": "error", "text": friendly_error(e),
@@ -488,7 +592,7 @@ def create_app(services_factory: Callable[[], Services] | None = None, local_set
 
         def work(emit: Emit) -> dict:
             ans = answer_from_web(s.llm, s.web, query, msg["question"],
-                                  progress=lambda m: emit({"type": "status", "message": m}))
+                                  progress=lambda m: emit({"type": "status", "message": m}), on_text=text_stream(emit))
             s.db.set_offer_state(conv_id, "done", mid, query)
             return {"type": "answer", "message": s.db.add_message(conv_id, answer_message(ans))}
 
